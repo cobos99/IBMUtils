@@ -10,7 +10,7 @@ import numpy as np
 
 def pauli_to_str(pauli):
     if type(pauli) == Pauli:
-        return "".join([str(opel) for opel in pauli])
+        return "".join([str(opel) for opel in invert_pauli_order(pauli)])
     elif type(pauli) == str:
         return pauli
     else:
@@ -30,7 +30,7 @@ def pauli_equal_uptophase(pauli1, pauli2):
 
 def invert_pauli_order(pauli):
     if not isinstance(pauli, Pauli):
-        pauli = Pauli(pauli)
+        pauli = invert_pauli_order(Pauli(pauli))
     return Pauli((pauli.z[::-1], pauli.x[::-1], pauli.phase))
     
 # def get_commuting_groups_and_change_of_basis(operators):
@@ -135,9 +135,12 @@ def measure_observables(samples_dict, diagonal_observables, basis="Z", confidenc
             return np.full(len(diagonal_observables), np.nan), np.full((len(diagonal_observables), 2), np.nan)
         else: 
             return np.full(len(diagonal_observables), np.nan)
-    strings_expectation_values = np.zeros((len(samples_dict), len(diagonal_observables)), dtype=complex)
+    strings_expectation_values = np.zeros((len(samples_dict), len(diagonal_observables)))
     observables_mask = np.array([[int(str(opel) == basis) for opel in observable] for observable in diagonal_observables])
     observables_phases = np.array([1j**obs.phase for obs in diagonal_observables])
+    if np.any(observables_phases.imag != 0):
+        raise ValueError("Diagonal observables must have +-1 phases")
+    observables_phases = observables_phases.real
     for i, state_string in enumerate(samples_dict.keys()):
         state_string_rep = np.repeat(np.array([[int(c) for c in state_string]]), [len(diagonal_observables)], axis=0)
         observables_expectation_value = (-1)**(np.sum(state_string_rep*observables_mask, axis=1) % 2) * observables_phases
@@ -146,8 +149,6 @@ def measure_observables(samples_dict, diagonal_observables, basis="Z", confidenc
     strings_expectation_times_weights = strings_expectation_values * weights.reshape((len(samples_dict), 1))
     expectation_values = np.sum(strings_expectation_times_weights, axis=0)
     if confidence is not None:
-        if not np.equal(observables_phases.real, observables_phases).all():
-            raise ValueError("Confidence intervals can only be computed for observables with real expectation values")
         if list(samples_dict.values())[0] < 1:
             if shots is None:
                 raise ValueError("To boostrap a probability dictionary, shots must be provided")
@@ -213,14 +214,6 @@ from collections import Counter
 import sympy as sym
 
 # AUXILIARY FUNCTIONS
-
-def pauli_to_str(pauli):
-    if type(pauli) == Pauli:
-        return "".join([str(opel) for opel in pauli])
-    elif type(pauli) == str:
-        return pauli
-    else:
-        raise ValueError("pauli argument is not a Pauli object")
 
 def check_postselection_observable_commutation(observables, postselection_ops):
     postselection_ops = PauliList([Pauli(postselection_op) for postselection_op in postselection_ops])
