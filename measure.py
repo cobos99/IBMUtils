@@ -1,6 +1,6 @@
 from multiprocessing.shared_memory import SharedMemory
-from utils.bootstrap import bootstrap_sample_dict_mean
-from utils.samples import threadsafe_samples_transfer
+from hardware.utils.bootstrap import bootstrap_sample_dict_mean
+from hardware.utils.samples import threadsafe_samples_transfer
 from hardware.utils.misc import iterate_nested_list
 from qiskit.quantum_info import Pauli, PauliList
 from qiskit.exceptions import QiskitError

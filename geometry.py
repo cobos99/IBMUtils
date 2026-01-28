@@ -1,7 +1,7 @@
 # Contributor: César Benito Lamata @cesarBLG
 
-from utils.execution import backends_objs_to_names
-from utils.plotting import best_text_color
+from hardware.utils.execution import backends_objs_to_names
+from hardware.utils.plotting import best_text_color
 from functools import cached_property
 import matplotlib.pyplot as plt
 import matplotlib as mpl
