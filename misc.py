@@ -58,12 +58,16 @@ def del_all_nested_elements_by_value(lst, value, *, eq=lambda a, b: a == b):
 def numpy_array_of_witerables(weird_iterables, extra_inclusions=()):
     if isinstance(weird_iterables, np.ndarray):
         return weird_iterables
+    try:
+        len(weird_iterables[0])
+    except TypeError:
+        return np.array(weird_iterables, dtype=object)
     dimensions = 0
     last_element = weird_iterables
     dimensions_length = []
     types_arr = (tuple, list, np.ndarray, set, *extra_inclusions)
     if not isinstance(last_element, types_arr):
-        arr = np.array([], dtype=object)
+        arr = []
         arr.append(last_element)
         return arr
     while isinstance(last_element, types_arr):
@@ -74,6 +78,7 @@ def numpy_array_of_witerables(weird_iterables, extra_inclusions=()):
             dimensions += 1
         except TypeError:
             raise TypeError("weird_iterables is not a list of non tuple/list/set/ndarray iterables")
+            # break
     arr = np.empty(dimensions_length, dtype=object)
     dimensions_length = np.array(dimensions_length)
     for i, qc in enumerate(iterate_nested_list(weird_iterables)):
