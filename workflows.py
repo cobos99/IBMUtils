@@ -188,25 +188,26 @@ def diag_obs_odr_byrows(job_samples, cal_samples, job_data, confidence=None,
 
     # Measure raw job and calibration observables
     if verbose: print("\rMeasuring job observables...".ljust(100), end="")
-    raw_observables = np.full((*job_samples.shape, diagonal_observables_ops.shape[1]), np.nan, dtype=complex)
-    raw_observables_confidence = np.full((*job_samples.shape, diagonal_observables_ops.shape[1], 2), np.nan, dtype=complex)
-    cal_observables = np.full(cal_samples.shape, np.nan, dtype=complex)
-    cal_observables_confidence = np.full((*cal_samples.shape, 2), np.nan, dtype=complex)
+    raw_observables = np.full((*job_samples.shape, diagonal_observables_ops.shape[1]), np.nan)
+    raw_observables_confidence = np.full((*job_samples.shape, diagonal_observables_ops.shape[1], 2), np.nan)
+    cal_observables = np.full(cal_samples.shape, np.nan)
+    cal_observables_confidence = np.full((*cal_samples.shape, 2), np.nan)
     for i in range(jobs_shape[0]):
         last_obs_ind = len([obs for obs in diagonal_observables_ops[i, :] if obs is not np.nan])
         raw_observables[i, :, :last_obs_ind], raw_observables_confidence[i, :, :last_obs_ind, :] = measure.many_measure_diagonal_observables(job_samples[i, :], diagonal_observables_ops[i, :last_obs_ind], confidence=0 if confidence is None else confidence)
 
     if verbose: print("\rMeasuring calibration observables...".ljust(100), end="")
-    p_arr = np.full((*cal_samples.shape, cal_diagonal_observables_ops.shape[1]), np.nan, dtype=complex)
-    cal_observables = np.full((*cal_samples.shape, cal_diagonal_observables_ops.shape[1]),  np.nan, dtype=complex)
-    cal_observables_confidence = np.full((*cal_samples.shape, cal_diagonal_observables_ops.shape[1], 2), np.nan, dtype=complex)
+    p_arr = np.full((*cal_samples.shape, cal_diagonal_observables_ops.shape[1]), np.nan)
+    cal_observables = np.full((*cal_samples.shape, cal_diagonal_observables_ops.shape[1]),  np.nan)
+    cal_observables_confidence = np.full((*cal_samples.shape, cal_diagonal_observables_ops.shape[1], 2), np.nan)
     for i in range(cal_shape[0]):
-        last_obs_ind = len([obs for obs in diagonal_observables_ops[i, :] if obs is not np.nan])
-        cal_observables[i, :, :last_obs_ind], cal_observables_confidence[i, :, :last_obs_ind, :] = measure.many_measure_diagonal_observables(cal_samples[i, :], cal_diagonal_observables_ops[i, :], confidence=0 if confidence is None else confidence)
+        last_obs_ind = len([obs for obs in cal_diagonal_observables_ops[i, :] if obs is not np.nan])
+        cal_observables[i, :, :last_obs_ind], cal_observables_confidence[i, :, :last_obs_ind, :] = measure.many_measure_diagonal_observables(cal_samples[i, :], cal_diagonal_observables_ops[i, :last_obs_ind], confidence=0 if confidence is None else confidence)
         p_arr[i, :, :last_obs_ind] = odr.compute_depolarizing_probability(cal_observables[i, :, :last_obs_ind], odr_expected_observables[i, :last_obs_ind], 0, nqubits)
 
     # Renormalize job observables
     clean_observables, clean_observables_confidence = odr.renormalize_observable(raw_observables, p_arr, 0, nqubits, observable_range=None, expected_observable_arr=odr_expected_observables, observable_confidence=raw_observables_confidence)
+    clean_observables, clean_observables_confidence = np.zeros_like(cal_observables), np.zeros_like(cal_observables_confidence)
     if verbose: print(f"\rLoaded {len(job_samples.flatten()) + len(cal_samples.flatten())} jobs".ljust(100))
     to_return = [[clean_observables, cal_observables, raw_observables]]
     if confidence is not None:
@@ -260,11 +261,11 @@ def diag_obs_odr_byweight(job_samples, cal_samples, job_data, confidence=None,
 
     # Measure raw job and calibration observables
     if verbose: print("\rMeasuring job observables...".ljust(100), end="")
-    raw_observables = np.full((*job_samples.shape, diagonal_observables_ops.shape[1]), np.nan, dtype=complex)
-    raw_observables_confidence = np.full((*job_samples.shape, diagonal_observables_ops.shape[1], 2), np.nan, dtype=complex)
-    cal_observables = np.full(cal_samples.shape, np.nan, dtype=complex)
-    cal_observables_confidence = np.full((*cal_samples.shape, 2), np.nan, dtype=complex)
-    p_arr = np.full(cal_samples.shape, np.nan, dtype=complex)
+    raw_observables = np.full((*job_samples.shape, diagonal_observables_ops.shape[1]), np.nan)
+    raw_observables_confidence = np.full((*job_samples.shape, diagonal_observables_ops.shape[1], 2), np.nan)
+    cal_observables = np.full(cal_samples.shape, np.nan)
+    cal_observables_confidence = np.full((*cal_samples.shape, 2), np.nan)
+    p_arr = np.full(cal_samples.shape, np.nan)
     for i in range(jobs_shape[0]):
         last_obs_ind = len([obs for obs in diagonal_observables_ops[i, :] if obs is not np.nan])
         raw_observables[i, :, :last_obs_ind], raw_observables_confidence[i, :, :last_obs_ind, :] = measure.many_measure_diagonal_observables(job_samples[i, :], diagonal_observables_ops[i, :last_obs_ind], confidence=0 if confidence is None else confidence)
