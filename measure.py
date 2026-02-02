@@ -17,7 +17,7 @@ def pauli_to_str(pauli):
         raise ValueError("pauli argument is not a Pauli object")
 
 def pauli_weight(pauli):
-    counts = Counter(str(pauli))
+    counts = Counter(pauli_to_str(pauli))
     return len(pauli) - counts['I']
 
 def pauli_equal_uptophase(pauli1, pauli2):
@@ -136,7 +136,7 @@ def measure_observables(samples_dict, diagonal_observables, basis="Z", confidenc
         else: 
             return np.full(len(diagonal_observables), np.nan)
     strings_expectation_values = np.zeros((len(samples_dict), len(diagonal_observables)))
-    observables_mask = np.array([[int(str(opel) == basis) for opel in observable] for observable in diagonal_observables])
+    observables_mask = np.array([[int(str(opel) == basis) for opel in invert_pauli_order(observable)] for observable in diagonal_observables])
     observables_phases = np.array([1j**obs.phase for obs in diagonal_observables])
     if np.any(observables_phases.imag != 0):
         raise ValueError("Diagonal observables must have +-1 phases")
