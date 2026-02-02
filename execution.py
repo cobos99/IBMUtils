@@ -4,6 +4,7 @@ from qiskit_experiments.framework import BatchExperiment, ParallelExperiment
 from qiskit_ibm_runtime import Batch, Session, SamplerV2
 from qiskit.transpiler import InstructionProperties
 import hardware.utils.benchmarks as benchmarks
+import hardware.utils.circs as circutils
 import numpy as np
 import copy
 
@@ -322,12 +323,12 @@ def execute_sampler_batch(backend, sampler_opt_dict, job_circuits, cal_circuits=
 def execute_sampler_batch_choosing_layout(backend, sampler_opt_dict, job_log_circuits, cal_log_circuits=None, repeat_cal=False, db_options=None, job_db=None, share_total_shots=False, max_shots=75000):
     job_log_circuits = numpy_array_of_circuits(job_log_circuits)
     if cal_log_circuits is not None: 
-        cal_circuits = numpy_array_of_circuits(cal_log_circuits)
+        cal_log_circuits = numpy_array_of_circuits(cal_log_circuits)
 
     if len(job_log_circuits.shape) < 2:
         job_log_circuits = job_log_circuits[None]
     if cal_log_circuits is not None:
-        if len(cal_circuits.shape) < 2:
+        if len(cal_log_circuits.shape) < 2:
             cal_log_circuits = cal_log_circuits[None]
     else:
         repeat_cal = False
@@ -367,22 +368,23 @@ def execute_sampler_batch_choosing_layout(backend, sampler_opt_dict, job_log_cir
         sampler_options_per_job_circ = [edited_sampler_options]
         sampler_options_per_cal_circ = [edited_sampler_options]
 
-    batch_options = {"job_circuits_shape": job_circuits.shape, "cal_circuits_shape": cal_circuits.shape if cal_circuits is not None else None, "nrepetitions": nrepetitions, "repeat_cal": repeat_cal}
+    batch_options = {"job_circuits_shape": job_log_circuits.shape, "cal_circuits_shape": cal_log_circuits.shape if cal_log_circuits is not None else None, "nrepetitions": nrepetitions, "repeat_cal": repeat_cal}
     jobs = []
 
     benchmark_batches = benchmarks.ibm_metrics_experiments(backend)
     benchmark_batches_exp = BatchExperiment(benchmark_batches, backend)
     coupling_graph = backend.coupling_map.graph.to_undirected(multigraph=False)
     one_dir_coupling_map = coupling_graph.edge_list()
-    batch_options["batch_id"] = session.session_id
     instruction_2q_name = "cz"
     with Session(backend=backend) as session:
+        batch_options["batch_id"] = session.session_id
+
         # Run benchmarks for circuits
-        layout_sampler_dict = sampler_options_per_job_circ[0]
+        layout_sampler = SamplerV2(mode=session)
 
         # Run characterization experiments
         batches_exp_data = benchmark_batches_exp.run(
-            sampler=layout_sampler_dict, **{"shots": 1e3, "dynamic": False}
+            sampler=layout_sampler, **{"shots": 1e3, "dynamic": False}
         ).block_for_results()
     
         EPG_sx_result_list = batches_exp_data.analysis_results("EPG_sx")
@@ -471,37 +473,42 @@ def execute_sampler_batch_choosing_layout(backend, sampler_opt_dict, job_log_cir
                     ),
                 )
     
-    # Transpile circuits choosing best layout
-    pm = generate_preset_pass_manager(target=target, optimization_level=3)
-    job_circuits = pm.run(job_log_circuits)
-    if cal_log_circuits is not None:
-        cal_circuits = pm.run(cal_log_circuits)
+        # Transpile circuits choosing best layout
+        pm = generate_preset_pass_manager(target=target, optimization_level=3)
+        flatten_job_log_circuits = numpy_array_of_circuits(job_log_circuits).flatten()
+        depths = np.array([circutils.depth2qb(c) for c in flatten_job_log_circuits])
+        longest_circuit_ind = np.argmax(depths)
+        transpiled_longest_circuit = pm.run(flatten_job_log_circuits[longest_circuit_ind])
+        chosen_layout = transpiled_longest_circuit.layout.final_index_layout()
+        job_circuits = circutils.transpile_circuits_with_consistent_layout(job_log_circuits, backend, chosen_layout)
+        if cal_log_circuits is not None:
+            cal_circuits = circutils.transpile_circuits_with_consistent_layout(cal_log_circuits, backend, chosen_layout)
 
-    if cal_circuits is None:
-        circuits_to_run = multirep_structure(job_circuits, nrepetitions).flatten()
-        this_options_job_func = lambda i: sampler_options_per_job_circ[i % nrepetitions]
-    else:
-        if job_circuits.shape == cal_circuits.shape:
-            circuits_to_run = multirep_structure(job_circuits, nrepetitions, cal_circuits, repeat_cal).flatten()
-            def this_options_job_func(i):
-                if (i % 2) == 0:
-                    return sampler_options_per_cal_circ[(i // 2) % (nrepetitions if repeat_cal else 1)]
-                else:
-                    return sampler_options_per_job_circ[(i // 2) % nrepetitions]
-        else:
+        if cal_circuits is None:
             circuits_to_run = multirep_structure(job_circuits, nrepetitions).flatten()
-            repeated_cal_circuits = multirep_structure(cal_circuits, nrepetitions).flatten()
-            circuits_to_run = np.concatenate([repeated_cal_circuits, circuits_to_run])
-            def this_options_job_func(i):
-                if i < (len(circuits_to_run) - len(repeated_cal_circuits)):
-                    return sampler_options_per_job_circ[i % nrepetitions]
-                else:
-                    return sampler_options_per_cal_circ[(i - (len(circuits_to_run) - len(repeated_cal_circuits))) % (nrepetitions if repeat_cal else 1)]
-    
-    circuits_to_run = [check_and_measure_active_qubits(c) for c in circuits_to_run]
-    for i, circuit in enumerate(circuits_to_run):
-        sampler = SamplerV2(mode=session, options=this_options_job_func(i))
-        jobs.append(sampler.run([circuit]))
+            this_options_job_func = lambda i: sampler_options_per_job_circ[i % nrepetitions]
+        else:
+            if job_circuits.shape == cal_circuits.shape:
+                circuits_to_run = multirep_structure(job_circuits, nrepetitions, cal_circuits, repeat_cal).flatten()
+                def this_options_job_func(i):
+                    if (i % 2) == 0:
+                        return sampler_options_per_cal_circ[(i // 2) % (nrepetitions if repeat_cal else 1)]
+                    else:
+                        return sampler_options_per_job_circ[(i // 2) % nrepetitions]
+            else:
+                circuits_to_run = multirep_structure(job_circuits, nrepetitions).flatten()
+                repeated_cal_circuits = multirep_structure(cal_circuits, nrepetitions).flatten()
+                circuits_to_run = np.concatenate([repeated_cal_circuits, circuits_to_run])
+                def this_options_job_func(i):
+                    if i < (len(circuits_to_run) - len(repeated_cal_circuits)):
+                        return sampler_options_per_job_circ[i % nrepetitions]
+                    else:
+                        return sampler_options_per_cal_circ[(i - (len(circuits_to_run) - len(repeated_cal_circuits))) % (nrepetitions if repeat_cal else 1)]
+        
+        circuits_to_run = [check_and_measure_active_qubits(c) for c in circuits_to_run]
+        for i, circuit in enumerate(circuits_to_run):
+            sampler = SamplerV2(mode=session, options=this_options_job_func(i))
+            jobs.append(sampler.run([circuit]))
     
     if job_db is not None:
         job_ids = [job.job_id() for job in jobs]
