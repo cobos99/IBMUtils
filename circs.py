@@ -72,6 +72,10 @@ def remove_barriers(circuit):
     circuit = pm.run(circuit)
     return circuit
 
+def remove_barriers_transpiled(circuit, backend):
+    pm = generate_preset_pass_manager(optimization_level=1, backend=backend)
+    return pm.run(RemoveBarriers()(circuit))
+
 def check_and_measure_active_qubits(circuit):
     if not circuit.cregs:
         circuit = circuit.copy()
