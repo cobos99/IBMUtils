@@ -49,15 +49,16 @@ def plot_circuit_arr_depth(circuit_arr, x_ticks=None, x_label=None, filepath="")
 
     fig, ax = plt.subplots(figsize=[9, 6])
     
-    if x_ticks is None:
-        x_ticks = np.arange(1, len(circuit_arr)+1)
+    x = np.arange(1, len(circuit_arr)+1)
     y = [depth2qb(circ) for circ in circuit_arr]
     color = plt.get_cmap("Set2")((1 % 8)/8 + 0.01)
-    plt.plot(x_ticks, y, "o--", markersize=12, markeredgecolor="black", color=color)
+    plt.plot(x, y, "o--", markersize=12, markeredgecolor="black", color=color)
     if x_label is None:
         plt.xlabel("Circuit index", labelpad=10)
     else:
         plt.xlabel(x_label, labelpad=10)
+    if x_ticks is not None:
+        plt.xticks(x_ticks)
     plt.ylabel("Depth")
     plt.grid(color="gray", linestyle="dashdot", linewidth=1.6, zorder=0)
     plt.tight_layout()
