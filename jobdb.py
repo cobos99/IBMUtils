@@ -127,6 +127,10 @@ class ExecDB:
         jobs = execution.execute_sampler_batch_choosing_layout(backend, sampler_opt_dict, job_log_circuits, cal_log_circuits, repeat_cal, db_options, self, share_total_shots, max_shots)
         return jobs
 
+    def execute_sampler_batch_choosing_layout_by_batches(self, backend, sampler_opt_dict, job_log_circuits, batches_first_index, cal_log_circuits=None, db_options=None, optimization_level=0):
+        jobs = execution.execute_sampler_batch_choosing_layout_by_batches(backend, sampler_opt_dict, job_log_circuits, batches_first_index, cal_log_circuits, db_options, self, optimization_level)
+        return jobs
+
     # def load_final_samples_from_local_or_ibmq(self, batch_args, ibmq_service, jobs_result_folder, job_index=0, return_data=False, verbose=False):
     #     jobs_data = self.search_by_params(batch_args, "Sampler", ibmq_service=None, limit=job_index+1)
     #     try:
