@@ -125,9 +125,9 @@ def workflow(job_samples, cal_samples, job_data, confidence=None,
     except KeyError:
         raise KeyError(f"Missing required job_data key: {e}")
     odr_expected_observables = odr_expected_observables_T + odr_expected_observables_sb + odr_expected_observables_int
-    # odr_expected_observables = miscutils.to_padded_array(odr_expected_observables, fill_value=np.nan, dtype=float)
-    # if odr_expected_observables.shape != cal_dobservables.shape:
-    #     raise WorkflowError("'odr_expected_observables' shape does not match 'cal_dobservables' shape")
+    odr_expected_observables = miscutils.to_padded_array(odr_expected_observables, fill_value=np.nan, dtype=float)
+    if odr_expected_observables.shape != cal_dobservables.shape:
+        raise WorkflowError("'odr_expected_observables' shape does not match 'cal_dobservables' shape")
 
     job_samples_T = job_samples[:1, :]
     job_samples_sb = job_samples[1:1+sim_dobservables_sb.shape[0], :]
@@ -207,6 +207,10 @@ def workflow(job_samples, cal_samples, job_data, confidence=None,
                     cal_row_ind = 0
                     cal_weight_index = cal_observables_int_weights[cal_row_ind].index(this_obs_weight)
                 clean_obsexp_int[i, :, j], clean_obsexp_conf_int[i, :, j, :] = odr.renormalize_observable(raw_job_obsexp_int[i, :, j], p_arr_int[cal_row_ind, :, cal_weight_index], 0, nqubits, observable_range=None, expected_observable_arr=odr_expected_observables_int[cal_row_ind][cal_weight_index], observable_confidence=raw_job_obsexp_conf_int[i, :, j, :])
+
+    # DEBUG
+    # to_return = [[clean_obsexp_T], [cal_obsexp_T], [raw_job_obsexp_T]]
+    # return to_return
 
     if verbose: print(f"\rLoaded {len(job_samples.flatten()) + len(cal_samples.flatten())} jobs".ljust(100))
     to_return = [[[clean_obsexp_T, clean_obsexp_sb, clean_obsexp_int],
