@@ -97,13 +97,26 @@ def find_index_nested(lst, value, *, eq=lambda a, b: a == b):
                 return (i,) + sub
     return None
 
-def to_padded_array(list_of_lists, fill_value=np.nan, dtype=float, extra_iterable_types=()):
-    n = len(list_of_lists)
-    maxlen = max(len(row) for row in list_of_lists)
-    out = np.full((n, maxlen), fill_value, dtype=dtype)
-    for i, row in enumerate(list_of_lists):
-        out[i, :len(row)] = numpy_array_of_witerables(row, extra_inclusions=extra_iterable_types)
-    return out
+def get_list_shape(lst, extra_iterable_types=()):
+    if isinstance(lst, (list, tuple, np.ndarray, *extra_iterable_types)):
+        lengths = [get_list_shape(item, extra_iterable_types=extra_iterable_types) for item in lst]
+        max_shape = tuple(max(s[i] if len(s) > i else 0 for s in lengths) for i in range(max(map(len, lengths), default=0)))
+        return (len(lst),) + max_shape
+    else:
+        return ()
+
+def fill_array(arr, lst, idx=(), extra_iterable_types=()):
+    if isinstance(lst, (list, tuple, np.ndarray, *extra_iterable_types)):
+        for i, item in enumerate(lst):
+            fill_array(arr, item, idx + (i,), extra_iterable_types=extra_iterable_types)
+    else:
+        arr[idx] = lst
+
+def to_padded_array(nested_list, fill_value=np.nan, dtype=float, extra_iterable_types=()):
+    shape = get_list_shape(nested_list, extra_iterable_types=extra_iterable_types)
+    arr = np.full(shape, fill_value, dtype=dtype)
+    fill_array(arr, nested_list, extra_iterable_types=extra_iterable_types)
+    return arr
 
 def padded_array_to_list(padded_array, pad_value=np.nan):
     if not isinstance(padded_array, np.ndarray):
