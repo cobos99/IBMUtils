@@ -17,7 +17,11 @@ class ExecDB:
         else:
             self._data = []
             with open(path, "w") as f:
-                json.dump(self._data, f, indent=4)   
+                json.dump(self._data, f, indent=4)
+
+    def reload(self):
+        with open(self.path, "r") as f:
+            self._data = json.load(f)
 
     def save(self):
         with open(self.path, "w") as f:
@@ -100,6 +104,7 @@ class ExecDB:
         thisid = 0 if len(self._data) == 0 else self._data[-1]["id"] + 1
         data_to_add = {"id": thisid}
         data_to_add = data_to_add | self.generate_batch_db_data(batch_args, ran_circuits, observable_generating_func_name, job_ids_arr)
+        self.reload()
         self._data.append(data_to_add)
         self.save()
 
@@ -111,6 +116,7 @@ class ExecDB:
             data_to_add["id"] = thisid
         else:
             data_to_add = {"id": thisid} | data
+        self.reload()
         self._data.append(data_to_add)
         self.save()
 
@@ -123,12 +129,16 @@ class ExecDB:
         jobs = execution.execute_sampler_batch(backend, sampler_opt_dict, job_circuits, cal_circuits, repeat_cal, db_options, self, share_total_shots, max_shots)
         return jobs
 
-    def execute_sampler_batch_choosing_layout(self, backend, sampler_opt_dict, job_log_circuits, cal_log_circuits=None, repeat_cal=False, db_options=None, share_total_shots=False, max_shots=75000):
-        jobs = execution.execute_sampler_batch_choosing_layout(backend, sampler_opt_dict, job_log_circuits, cal_log_circuits, repeat_cal, db_options, self, share_total_shots, max_shots)
+    def execute_sampler_batch_choosing_layout(self, backend, sampler_opt_dict, job_log_circuits, cal_log_circuits=None, repeat_cal=False, db_options=None, share_total_shots=False, optimization_level=3, max_shots=75000):
+        jobs = execution.execute_sampler_batch_choosing_layout(backend, sampler_opt_dict, job_log_circuits, cal_log_circuits, repeat_cal, db_options, self, share_total_shots, optimization_level, max_shots)
         return jobs
 
-    def execute_sampler_batch_choosing_layout_by_batches(self, backend, sampler_opt_dict, job_log_circuits, batches_first_index, cal_log_circuits=None, db_options=None, optimization_level=0):
-        jobs = execution.execute_sampler_batch_choosing_layout_by_batches(backend, sampler_opt_dict, job_log_circuits, batches_first_index, cal_log_circuits, db_options, self, optimization_level)
+    def execute_sampler_batch_choosing_layout_by_batches(self, backend, sampler_opt_dict, job_log_circuits, batches_first_index, cal_log_circuits=None, jobcal_together=False, db_options=None, optimization_level=0):
+        jobs = execution.execute_sampler_batch_choosing_layout_by_batches(backend, sampler_opt_dict, job_log_circuits, batches_first_index, cal_log_circuits, jobcal_together, db_options, self, optimization_level)
+        return jobs
+
+    def execute_znepea_choosing_layout(self, backend, job_log_barrier_circuits, parameters_func, db_options, uinst_filter_func=None, optimization_level=3):
+        jobs = execution.execute_znepea_choosing_layout(backend, job_log_barrier_circuits, parameters_func, db_options, uinst_filter_func, self, optimization_level)
         return jobs
 
     # def load_final_samples_from_local_or_ibmq(self, batch_args, ibmq_service, jobs_result_folder, job_index=0, return_data=False, verbose=False):
@@ -156,7 +166,10 @@ class ExecDB:
             raise ValueError(f"No batch found with the provided parameters")
         jobs_ids = [job["job_id"] for job in jobs_data["jobs"]]
         jobs_results = load_results_from_local_or_ibmq(jobs_ids, ibmq_service, jobs_result_folder, verbose=verbose)
-        jobs_samples = [samples_from_result(job_result) for job_result in jobs_results]
+        # jobs_samples = [samples_from_result(job_result) for job_result in jobs_results]
+        jobs_samples = []
+        for job_result in jobs_results:
+            jobs_samples += samples_from_result(job_result)
         jobs_samples = np.array(jobs_samples, dtype=object)
         jobs_shape = jobs_data["job_circuits_shape"]
         cal_shape = jobs_data["cal_circuits_shape"]
@@ -219,11 +232,16 @@ def load_results_from_local_or_ibmq(job_ids, ibmq_service, jobs_result_folder, v
     return job_results
 
 def samples_from_result(job_result):
+    # if job_result is None:
+    #     return {}
+    # try:
+    #     job_result = job_result[0]
+    # except (IndexError, TypeError):
+    #     pass
+    # samples = list(dict(job_result.data).values())[0].get_counts()
+    # return samples
     if job_result is None:
-        return {}
-    try:
-        job_result = job_result[0]
-    except (IndexError, TypeError):
-        pass
-    samples = list(dict(job_result.data).values())[0].get_counts()
-    return samples
+        return [{}]
+    else:
+        samples = [list(dict(res.data).values())[0].get_counts() for res in job_result]
+        return samples
