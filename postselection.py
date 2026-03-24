@@ -1,7 +1,7 @@
 from multiprocessing.shared_memory import SharedMemory
-from utils.samples import threadsafe_samples_transfer
+from hardware.utils.samples import threadsafe_samples_transfer
 from qiskit.quantum_info import Pauli, PauliList
-import utils.measure as measure
+import hardware.utils.measure as measure
 from pymatching import Matching
 import multiprocessing as mp
 import numpy as np

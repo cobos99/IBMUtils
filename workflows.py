@@ -4,7 +4,7 @@ from qiskit.result import QuasiDistribution
 import hardware.utils.postselection as ps
 import hardware.utils.measure as measure
 import hardware.utils.samples as samples
-import hardware.utils.layoutzne as lzne
+import hardware.utils.zne as znemod
 import hardware.utils.misc as miscutils
 import hardware.utils.odr as odr
 import hardware.utils.dec as dec
@@ -333,7 +333,7 @@ def layout_zne(job_samples, job_data, observables_genfuncs,
     noise_rates_for_reg = noise_rates.T.reshape(-1, layouts_zne.shape[0])
     noise_rates_for_reg = np.tile(noise_rates_for_reg, (observables_for_reg.shape[0]//noise_rates_for_reg.shape[0], 1))
     # noise_rates_for_reg = np.repeat(noise_rates_for_reg, observables_for_reg.shape[0]//noise_rates_for_reg.shape[0], axis=0)
-    results = [lzne.perform_linear_zne(nr, obs) for nr, obs in zip(noise_rates_for_reg, observables_for_reg)]
+    results = [zne.perform_linear_zne(nr, obs) for nr, obs in zip(noise_rates_for_reg, observables_for_reg)]
     zne_observables = np.array([res.intercept for res in results]).reshape(layout_mean_observables.shape[1::][::-1]).T
     zne_observables_condelta = np.array([res.std_err for res in results]).reshape(layout_mean_observables.shape[1::][::-1]).T
     if verbose: print(f"\rLoaded {len(job_samples.flatten())} jobs".ljust(100))
@@ -342,6 +342,106 @@ def layout_zne(job_samples, job_data, observables_genfuncs,
         to_return.append([zne_observables_condelta, layout_mean_observables_confdelta, raw_observables_confidence])
     if return_samples:
         to_return.append(job_samples)
+    return to_return if len(to_return) > 1 else to_return[0]
+
+def zne(job_samples, job_data, observables_genfuncs, 
+        zne_func=znemod.perform_linear_zne,
+        confidence=None, return_samples=False, verbose=False):
+    try:
+        noise_rates = np.array(job_data["noise_rates"])
+    except KeyError:
+        raise WorkflowError("job_data must contain the 'noise_rates' key")
+    if not isinstance(observables_genfuncs, (tuple, list)):
+        observables_genfuncs = [observables_genfuncs]
+    raw_observables_shape = (*job_data["job_circuits_shape"], len(observables_genfuncs))
+    job_samples = np.array(job_samples, dtype=object).flatten()
+    nqubits = len(list(job_samples[0].keys())[0])
+    diagonal_observbles_ops, non_diagonal_observables_ops = measure.generate_observables(nqubits, observables_genfuncs)
+    if non_diagonal_observables_ops:
+        raise ValueError("The provided observables are not diagonal in the Z basis")
+    if len(noise_rates) != raw_observables_shape[0]:
+        raise ValueError("The length of noise_rates must match the first dimension of job_samples")
+
+    # Measure observables
+    if verbose: print("\rMeasuring diagonal observables...".ljust(100), end="")
+    raw_observables, raw_observables_confidence = measure.many_measure_diagonal_observables(job_samples, diagonal_observbles_ops, confidence=0 if confidence is None else confidence)
+    raw_observables = raw_observables.reshape(*raw_observables_shape)
+    raw_observables_confidence = raw_observables_confidence.reshape(*raw_observables_shape, 2)
+
+    # ZNE extrapolation
+    observables_for_reg = raw_observables.T.reshape(-1, noise_rates.shape[0])
+    zne_results = [zne_func(noise_rates, obs) for obs in observables_for_reg]
+    zne_observables = np.array([res.intercept for res in zne_results]).reshape(raw_observables_shape[1::][::-1]).T
+    zne_observables_condelta = np.array([res.std_err for res in zne_results]).reshape(raw_observables_shape[1::][::-1]).T
+    if verbose: print(f"\rLoaded {len(job_samples.flatten())} jobs".ljust(100))
+    to_return = [[zne_observables, raw_observables]]
+    if confidence is not None:
+        to_return.append([zne_observables_condelta, raw_observables_confidence])
+    if return_samples:
+        to_return.append(job_samples)
+    return to_return if len(to_return) > 1 else to_return[0]
+
+def postselection_zne(job_samples, job_data, postselection_genfunc, observables_genfuncs, 
+                      flip_threshold=None, flipped_syndromes=None, minimum_shots=None,
+                      zne_func=znemod.perform_linear_zne,
+                      confidence=None,
+                      return_samples=False, return_postselected_samples=False, 
+                      verbose=False):
+    try:
+        noise_rates = np.array(job_data["noise_rates"])
+    except KeyError:
+        raise WorkflowError("job_data must contain the 'noise_rates' key")
+    if not isinstance(observables_genfuncs, (tuple, list)):
+        observables_genfuncs = [observables_genfuncs]
+    raw_observables_shape = (*job_data["job_circuits_shape"][::-1], len(observables_genfuncs))
+    # DEBUG
+    # raw_observables_shape = (*job_data["job_circuits_shape"], len(observables_genfuncs))
+    job_samples = np.array(job_samples, dtype=object).T.flatten()
+    nqubits = len(list(job_samples[0].keys())[0])
+    postselection_operators, diagonal_observbles_ops, non_diagonal_observables_ops, basis = ps.initialize_postselection(nqubits, postselection_genfunc, observables_genfuncs)
+    if non_diagonal_observables_ops:
+        raise ValueError("The provided observables are not diagonal in the Z basis")
+    if len(noise_rates) != raw_observables_shape[0]:
+        raise ValueError("The length of noise_rates must match the first dimension of job_samples")
+
+
+    if verbose: print("\rGenerating postselected samples...".ljust(100), end="")
+    postselected_samples = ps.get_recovered_samples(job_samples, postselection_operators, 
+                                                    flip_threshold=flip_threshold, flipped_syndromes=flipped_syndromes, 
+                                                    minimum_shots=minimum_shots)
+
+    # Measure observables
+    if verbose: print("\rMeasuring diagonal observables...".ljust(100), end="")
+    raw_observables, raw_observables_confidence = measure.many_measure_diagonal_observables(job_samples, diagonal_observbles_ops, confidence=0 if confidence is None else confidence)
+    raw_observables = raw_observables.reshape(*raw_observables_shape)
+    raw_observables_confidence = raw_observables_confidence.reshape(*raw_observables_shape, 2)
+
+    postselected_observables, postselected_observables_confidence = measure.many_measure_diagonal_observables(postselected_samples, diagonal_observbles_ops, confidence=0 if confidence is None else confidence)
+    postselected_observables = postselected_observables.reshape(*raw_observables_shape)
+    postselected_observables_confidence = postselected_observables_confidence.reshape(*raw_observables_shape, 2)
+
+    # ZNE extrapolation
+    # observables_for_reg = postselected_observables.reshape(-1, noise_rates.shape[0])
+    # zne_results = [zne_func(noise_rates, obs) for obs in observables_for_reg]
+    # zne_observables = np.array([res.intercept for res in zne_results]).reshape(raw_observables_shape[1::])
+    # zne_observables_condelta = np.array([res.std_err for res in zne_results]).reshape(raw_observables_shape[1::])
+    if verbose: print("\rPerforming ZNE extrapolation...".ljust(100), end="")
+    zne_observables = np.full(raw_observables_shape[1::], np.nan)
+    zne_observables_confidence = np.full((*raw_observables_shape[1::], 2), np.nan)
+    for ti in range(raw_observables_shape[1]):
+        for oind in range(raw_observables_shape[2]):
+            observables_for_reg = postselected_observables[:, ti, oind]
+            zne_results = zne_func(noise_rates, observables_for_reg)
+            zne_observables[ti, oind] = zne_results.intercept
+            zne_observables_confidence[ti, oind, 0] = zne_results.intercept - zne_results.std_err
+            zne_observables_confidence[ti, oind, 1] = zne_results.intercept + zne_results.std_err
+    
+    if verbose: print(f"\rLoaded {len(job_samples.flatten())} jobs".ljust(100))
+    to_return = [[zne_observables, postselected_observables, raw_observables]]
+    if confidence is not None:
+        to_return.append([zne_observables_confidence, postselected_observables_confidence, raw_observables_confidence])
+    if return_samples:
+        to_return.append([postselected_samples, job_samples])
     return to_return if len(to_return) > 1 else to_return[0]
 
 def sum_observables_terms(observables_expectation, observables_coupling, observables_confidence=None):
