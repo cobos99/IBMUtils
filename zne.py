@@ -3,6 +3,7 @@ from rustworkx.visualization import graphviz_draw
 import hardware.utils.circs as circutils
 import hardware.utils.misc as miscutils
 from IPython.display import display
+from scipy.optimize import curve_fit
 from scipy.stats import linregress
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
@@ -331,7 +332,7 @@ def plot_mapping(backend, layout):
     display(im)
 
 @dataclass
-class LayoutZNEResult:
+class ZNEResult:
     slope: float
     intercept: float
     r_value: float
@@ -346,7 +347,20 @@ def perform_linear_zne(noise_rates, measurements):
     measurements = np.array(measurements).flatten()
     if noise_rates.shape != measurements.shape:
         raise ValueError("Noise rates and measurements must have the same shape.")
-    return LayoutZNEResult(*linregress(noise_rates, measurements))
+    return ZNEResult(*linregress(noise_rates, measurements))
+
+def perform_exponential_zne(noise_rates, measurements, p0=None):
+    noise_rates = np.array(noise_rates).flatten()
+    measurements = np.array(measurements).flatten()
+    if noise_rates.shape != measurements.shape:
+        raise ValueError("Noise rates and measurements must have the same shape.")
+    def exp_func(x, a, b):
+        return a*np.exp(-b*x)
+    try:
+        popt, pcov = curve_fit(exp_func, noise_rates, measurements, p0=p0)
+        return ZNEResult(popt[1], popt[0], None, None, np.sqrt(np.diag(pcov))[1])
+    except RuntimeError:
+        return ZNEResult(np.nan, np.nan, None, None, np.nan)
 
 def plot_layoutzne_extrapolation(all_cycles_observables, zne_layouts, noise_rates, color=None):
     zne_layouts = np.array(zne_layouts)
