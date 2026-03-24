@@ -9,8 +9,9 @@ import multiprocessing as mp
 import numpy as np
 
 def pauli_to_str(pauli):
+    phasestr_dict = {0:"", 1:"i", 2:"-", 3:"-i"}
     if type(pauli) == Pauli:
-        return "".join([str(opel) for opel in invert_pauli_order(pauli)])
+        return phasestr_dict[pauli.phase] + "".join([str(opel) for opel in invert_pauli_order(pauli)])
     elif type(pauli) == str:
         return pauli
     else:
@@ -66,13 +67,13 @@ def is_diagonal(pauli, basis="Z"):
         raise ValueError("This function only work for Pauli objects or strings")
     pauli_str = pauli_to_str(pauli)
     for c in pauli_str:
-        if c not in ["I", basis]:
+        if c not in ["I", "-", "i", "-i", basis]:
             return False
     return True
 
 def diagonal_operators_check(operators):
     different_paulis = set("".join([pauli_to_str(op) for op in operators]))
-    if len(remaining_ops := (different_paulis - {"I"})) > 1:
+    if len(remaining_ops := (different_paulis - {"I", "-", "i", "-i"})) > 1:
         return False
     basis = remaining_ops.pop()
     all_diagonal = all([is_diagonal(op, basis=basis) for op in operators])
@@ -285,15 +286,6 @@ def diagonalization_susceptible_qb_range(observables, postselection_ops, return_
         return operator_ranges, PauliList(operators_affecting_obs_range)
     else:
         return operator_ranges
-    
-def is_diagonal(pauli, basis="Z"):
-    if not ((type(pauli) != Pauli) or (type(pauli) != str)):
-        raise ValueError("This function only work for Pauli objects or strings")
-    pauli_str = pauli_to_str(pauli)
-    for c in pauli_str:
-        if c not in ["I", basis]:
-            return False
-    return True
 
 def binary_pauli_representation(commuting_pauli_set):
     Sz = commuting_pauli_set.z[:, ::-1].T
