@@ -42,3 +42,43 @@ class GHZBlockChainStatePrep(QuantumCircuit):
                     # self.h(1)
                     # self.cx(1, 0)
                     pass
+
+class GHZBlockChainStatePrepBSize(QuantumCircuit):
+    def __init__(self, nqubits, block_size, roll=0):
+        super().__init__(nqubits)
+        if nqubits < 2:
+            raise ValueError("nqubits must be at least 2 for GHZ state preparation.")
+        block_number = nqubits // block_size
+        if block_size < 2:
+            raise ValueError(f"Block size = {block_size} must be at least 2 for GHZ state preparation.")
+        for i in range(block_number):
+            start = i * block_size
+            end = start + block_size
+            center = start + block_size // 2
+            self.h((center + roll) % nqubits)
+            for j in reversed(range(start, center)):
+                ctrl = (j+1 + roll) % nqubits
+                trgt = (j + roll) % nqubits
+                if trgt == ctrl - 1:
+                    self.cx(ctrl, trgt)
+            for j in range(center, end-1):
+                ctrl = (j + roll) % nqubits
+                trgt = (j+1 + roll) % nqubits
+                if trgt == ctrl + 1:
+                    self.cx(ctrl, trgt)
+
+        if nqubits % block_size != 0:
+            remaining_start = block_number * block_size
+            remaining_end = nqubits
+            center = (remaining_start + remaining_end) // 2
+            self.h((center + roll) % nqubits)
+            for j in reversed(range(remaining_start, center)):
+                ctrl = (j+1 + roll) % nqubits
+                trgt = (j + roll) % nqubits
+                if trgt == ctrl - 1:
+                    self.cx(ctrl, trgt)
+            for j in range(center, remaining_end-1):
+                ctrl = (j + roll) % nqubits
+                trgt = (j+1 + roll) % nqubits
+                if trgt == ctrl + 1:
+                    self.cx(ctrl, trgt)
