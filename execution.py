@@ -1,12 +1,11 @@
+from qiskit_addon_utils.noise_management.post_selection.transpiler.passes import AddPostSelectionMeasures, AddSpectatorMeasures
+from qiskit_ibm_runtime import Batch, Session, SamplerV2, Executor, NoiseLearnerV3, NoiseLearnerV3Options, QuantumProgram
 from hardware.utils.circs import numpy_array_of_circuits, check_and_measure_active_qubits
 from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
-from qiskit_experiments.framework import BatchExperiment, ParallelExperiment
-from qiskit_ibm_runtime import Batch, Session, SamplerV2
-from qiskit.transpiler import InstructionProperties
 import hardware.utils.benchmarks as benchmarks
+from qiskit.transpiler import PassManager
 import hardware.utils.circs as circutils
 import numpy as np
-import copy
 
 def multirep_structure(job_elements, nrepetitions, cal_elements=None, repeat_cal=False):
     if not nrepetitions.is_integer() or nrepetitions < 1:
@@ -197,7 +196,7 @@ def execute_sampler_batch_choosing_layout(backend, sampler_opt_dict, job_log_cir
         job_circuits = circutils.transpile_circuits_with_consistent_layout(job_log_circuits, backend, chosen_layout)
         if cal_log_circuits is not None:
             cal_circuits = circutils.transpile_circuits_with_consistent_layout(cal_log_circuits, backend, chosen_layout)
-        if cal_circuits is None:
+        if cal_log_circuits is None:
             circuits_to_run = multirep_structure(job_circuits, nrepetitions).flatten()
             this_options_job_func = lambda i: sampler_options_per_job_circ[i % nrepetitions]
         else:
@@ -230,7 +229,7 @@ def execute_sampler_batch_choosing_layout(backend, sampler_opt_dict, job_log_cir
 
     return jobs
 
-def execute_sampler_batch_choosing_layout_by_batches(backend, sampler_opt_dict, job_log_circuits, batches_first_index, cal_log_circuits=None, db_options=None, job_db=None, optimization_level=0):
+def execute_sampler_batch_choosing_layout_by_batches(backend, sampler_opt_dict, job_log_circuits, batches_first_index, cal_log_circuits=None, jobcal_together=False, db_options=None, job_db=None, optimization_level=0):
     job_log_circuits = numpy_array_of_circuits(job_log_circuits)
     if cal_log_circuits is not None:
         cal_log_circuits = numpy_array_of_circuits(cal_log_circuits)
@@ -269,11 +268,16 @@ def execute_sampler_batch_choosing_layout_by_batches(backend, sampler_opt_dict, 
             if cal_log_circuits is not None:
                 cal_circuits = circutils.transpile_circuits_with_consistent_layout(this_cal_log_circuits, backend, chosen_layout)
                 cal_circuits = [check_and_measure_active_qubits(c) for c in cal_circuits.flatten()]
-                if cal_log_circuits.shape[0] == job_log_circuits.shape[0]:
-                    this_circuits_to_run = multirep_structure(job_circuits, nrepetitions=1, cal_elements=cal_circuits, repeat_cal=False).flatten().tolist()
-                    circuits_to_run += this_circuits_to_run
-                    for c in this_circuits_to_run:
-                        jobs.append(sampler.run([c]))
+                if cal_log_circuits.shape == job_log_circuits.shape:
+                    if not jobcal_together:
+                        this_circuits_to_run = multirep_structure(job_circuits, nrepetitions=1, cal_elements=cal_circuits, repeat_cal=False).flatten().tolist()
+                        circuits_to_run += this_circuits_to_run
+                        for c in this_circuits_to_run:
+                            jobs.append(sampler.run([c]))
+                    else:
+                        circuits_to_run += job_circuits
+                        for jc, cc in zip(job_circuits, cal_circuits):
+                            jobs.append(sampler.run([cc, jc]))
                 else:
                     circuits_to_run += job_circuits
                     cal_circuits_to_run += cal_circuits
@@ -282,8 +286,12 @@ def execute_sampler_batch_choosing_layout_by_batches(backend, sampler_opt_dict, 
                     for c in job_circuits:
                         jobs.append(sampler.run([c]))
                     # jobs[-1].result()
+            else:
+                circuits_to_run += job_circuits
+                for c in job_circuits:
+                    jobs.append(sampler.run([c]))
     
-    if (cal_log_circuits is not None) and not (cal_log_circuits.shape[0] == job_log_circuits.shape[0]):
+    if (cal_log_circuits is not None) and not (cal_log_circuits.shape == job_log_circuits.shape):
         circuits_to_run = cal_circuits_to_run + circuits_to_run
         jobs = cal_jobs + jobs
 
@@ -291,6 +299,117 @@ def execute_sampler_batch_choosing_layout_by_batches(backend, sampler_opt_dict, 
         job_ids = [job.job_id() for job in jobs]
         all_options = (db_options if db_options is not None else {}) | batch_options | sampler_opt_dict
         job_db.add(all_options, circuits_to_run, "Sampler", job_ids)
+
+    return jobs
+
+def znepea_options_check(options_dict):
+    required_keys = [
+        "learner_num_randomizations",
+        "learner_shots_per_randomization",
+        "learner_layer_pair_depth",
+        "learner_post_selection_enabled",
+        "noise_factors",
+        "pt_num_randomizations",
+        "pt_shots_per_randomization",
+        "noise_factors"
+    ]
+    for key in required_keys:
+        if key not in options_dict:
+            raise ValueError(f"Missing required ZNE-PEA option: {key}")
+
+def diagobs_noise_amplification_argument_generator(samplex, parameter_values, noise_maps, noise_rates):
+    samplex_accepted_arguments = [spec for spec in samplex.inputs().specs]
+    samplex_arguments = {"pauli_lindblad_maps": noise_maps}
+    for spec in samplex_accepted_arguments:
+        if "basis_changes" in spec.name:
+            samplex_arguments[spec.name] = np.full(spec.shape, 0).tolist()
+        if "noise_scales" in spec.name:
+            samplex_arguments[spec.name] = noise_rates
+        if "parameter_values" in spec.name:
+            samplex_arguments[spec.name] = parameter_values
+    return samplex_arguments
+
+def execute_znepea_choosing_layout(backend, job_log_barrier_circuits, parameters_func, db_options, uinst_filter_func=None, job_db=None, optimization_level=3):
+    znepea_options_check(db_options)
+    job_log_circuits = numpy_array_of_circuits(job_log_barrier_circuits)
+    job_log_circuits_shape = job_log_circuits.shape
+    job_log_circuits = [circutils.check_and_measure_active_qubits(c) for c in job_log_circuits.flatten()]
+    batch_options = {"job_circuits_shape": job_log_circuits_shape, "cal_circuits_shape": None, "nrepetitions": 1, "repeat_cal": False}
+    jobs = []
+    with Session(backend=backend) as session:
+        batch_options["batch_id"] = session.session_id
+        
+        # Run the layout benchmarks
+        print("Running layout benchmarks...")
+        target = benchmarks.update_target(backend, session)
+        pm = generate_preset_pass_manager(target=target, optimization_level=optimization_level)
+        depths = np.array([circutils.depth2qb(c) for c in job_log_circuits])
+        longest_circuit_ind = np.argmax(depths)
+        transpiled_longest_circuit = pm.run(job_log_circuits[longest_circuit_ind])
+        chosen_layout = transpiled_longest_circuit.layout.final_index_layout()
+        job_circuits = circutils.transpile_circuits_with_consistent_layout(job_log_circuits, backend, chosen_layout)
+
+        # Prepare templates, samplexes and noise injected circuits
+        print("Preparing circuits for noise learning...")
+        box_job_circuits = circutils.box_circuits(job_circuits,
+                                                  enable_gates=True,
+                                                  enable_measures=True,
+                                                  twirling_strategy="active_circuit")
+        box_job_circuits_unist = circutils.get_unique_boxes(box_job_circuits.tolist(), undress_boxes=True, normalize_annotations=None)
+        if uinst_filter_func is not None:
+            box_job_circuits_unist = uinst_filter_func(box_job_circuits_unist)
+        
+        ninject_job_circuits = circutils.box_circuits(job_circuits,
+                                                      twirling_strategy="active_circuit",
+                                                      inject_noise_strategy="individual_modification",
+                                                      inject_noise_targets="gates",
+                                                      measure_annotations="all")
+
+        templates, samplexes = circutils.samplomatic_build(ninject_job_circuits)
+        if db_options["learner_post_selection_enabled"]:
+            # Set up post selection PM (to add PS instructions)
+            post_selection_pm = PassManager(
+                [
+                    AddSpectatorMeasures(backend.coupling_map),
+                    AddPostSelectionMeasures(x_pulse_type="rx"), #TODO: Change pulse type
+                ]
+            )
+            templates = post_selection_pm.run(templates)
+
+        # Run the noise learner
+        print("Running noise learner...")
+        noise_learner_options = NoiseLearnerV3Options(
+            num_randomizations=db_options["learner_num_randomizations"],
+            shots_per_randomization=db_options["learner_shots_per_randomization"],
+            layer_pair_depths=db_options["learner_layer_pair_depth"],
+            post_selection={
+                "enable": db_options["learner_post_selection_enabled"],
+                "strategy": "edge",
+                "x_pulse_type": "rx"
+            })
+        noise_learner = NoiseLearnerV3(mode=session, options=noise_learner_options)
+        noise_learner_job = noise_learner.run(instructions=box_job_circuits_unist)
+        noise_maps = noise_learner_job.result().to_dict(instructions=box_job_circuits_unist, require_refs=False)
+        batch_options["noise_learner_job_id"] = noise_learner_job.job_id()
+
+        # Submit jobs
+        print("Submitting jobs...")
+        executor = Executor(mode=session)
+        for i, (template, samplex) in enumerate(zip(templates, samplexes)):
+            samplex_arguments = diagobs_noise_amplification_argument_generator(samplex, parameter_values=parameters_func(i), noise_maps=noise_maps, noise_rates=db_options["noise_rates"])
+            program = QuantumProgram(shots=db_options["pt_shots_per_randomization"])
+            program.append_samplex_item(
+                circuit=template,
+                samplex=samplex,
+                samplex_arguments=samplex_arguments,
+                shape=(db_options["pt_num_randomizations"],)
+            )
+            jobs.append(executor.run(program))
+        
+    if job_db is not None:
+        job_ids = [job.job_id() for job in jobs]
+        all_options = (db_options if db_options is not None else {}) | batch_options
+        job_db.add(all_options, job_circuits, "ZNE-PEA", job_ids)
 
     return jobs
 
