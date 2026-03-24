@@ -2,11 +2,14 @@ from qiskit.transpiler.passes import Optimize1qGates, SetLayout, ApplyLayout, Fu
 from qiskit.converters import circuit_to_instruction, dag_to_circuit, circuit_to_dag
 from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
 from qiskit.transpiler import PassManager, StagedPassManager, Layout
+from samplomatic.transpiler import generate_boxing_pass_manager
+from samplomatic.utils import find_unique_box_instructions
 from hardware.utils.misc import iterate_nested_list
 from qiskit.circuit.library import XGate
 import hardware.utils.measure as measure
 from qiskit.dagcircuit import DAGCircuit
 from qiskit import QuantumCircuit, qpy
+import samplomatic
 import numpy as np
 import os
 
@@ -248,6 +251,42 @@ def transpile_circuit_to_many_layouts(logical_circuit, backend, initial_layouts,
     for i, pm in enumerate(pms):
         transpiled_circuits[i] = pm.run(logical_circuit)
     return transpiled_circuits
+
+def box_circuits(circ_arr, **box_kwargs):
+    bpm = generate_boxing_pass_manager(**box_kwargs)
+    ogshape = circ_arr.shape
+    circ_arr = circ_arr.flatten().tolist()
+    boxed_circuits = bpm.run(circ_arr)
+    boxed_circuits = numpy_array_of_circuits(boxed_circuits).reshape(ogshape)
+    return boxed_circuits
+
+def get_unique_boxes(circ_arr, undress_boxes=True, normalize_annotations=None):
+    if isinstance(circ_arr, QuantumCircuit):
+        circ_arr = [circ_arr]
+    elif isinstance(circ_arr, (list, tuple)):
+        if not all(isinstance(c, QuantumCircuit) for c in circ_arr):
+            raise ValueError("All elements of circ_arr must be QuantumCircuits")
+    else:
+        raise ValueError("circ_arr must be a QuantumCircuit or a list/tuple of QuantumCircuits")
+    unique_instructions = []
+    for circ in circ_arr:
+        unique_instructions.append(find_unique_box_instructions(circ, undress_boxes=undress_boxes, normalize_annotations=normalize_annotations))
+    return unique_instructions
+
+def samplomatic_build(circuits):
+    if isinstance(circuits, QuantumCircuit):
+        circuits = [circuits]
+    circuits = numpy_array_of_circuits(circuits)
+    ogshape = circuits.shape
+    templates = []
+    samplexes = []
+    for circ in circuits.flatten():
+        this_template, this_samples = samplomatic.build(circ)
+        templates.append(this_template)
+        samplexes.append(this_samples)
+    templates = numpy_array_of_circuits(templates).reshape(ogshape).squeeze().tolist()
+    samplexes = np.array(samplexes, dtype=object).reshape(ogshape).squeeze().tolist()
+    return templates, samplexes
 
 def translate_to_backend_gateset(backend, circuits, optimization_level=3):
     pm = generate_preset_pass_manager(basis_gates=backend.configuration().basis_gates, optimization_level=optimization_level)
