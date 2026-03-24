@@ -4,6 +4,7 @@ from qiskit.quantum_info import Pauli, PauliList
 import hardware.utils.grouper as grouper
 import hardware.utils.measure as measure
 import hardware.utils.misc as miscutils
+from qiskit import QuantumCircuit
 import hardware.utils.odr as odr
 import numpy as np
 
@@ -56,6 +57,226 @@ class XYChainStabilizerState(GHZBlockChainStatePrep):
                 self.h(i)
             if str(opel) == 'Y':
                 self.s(i)
+
+class TStabilizer(QuantumCircuit):
+    def __init__(self, nqubits, block_size, reverse=False):
+        super().__init__(nqubits)
+        if nqubits < 2:
+            raise ValueError("nqubits must be at least 2 for GHZ state preparation.")
+        if block_size < 2:
+            raise ValueError(f"Block size = {block_size} must be at least 2 for GHZ state preparation.")
+        block_number = nqubits // block_size + (1 if nqubits % block_size != 0 else 0)
+        for i in range(block_number - (1 if nqubits % block_size != 0 else 0)):
+            if reverse:
+                start = nqubits - (i + 1) * block_size
+                end = nqubits - i * block_size
+                center = start + block_size // 2
+            else:
+                start = i * block_size
+                end = start + block_size
+                center = start + block_size // 2
+            self.h(center)
+            for j in reversed(range(start, center)):
+                self.cx(j+1, j)
+            for j in range(center, end-1):
+                self.cx(j, j+1)
+
+        if (last_block_size := nqubits % block_size) != 0:
+            if reverse:
+                start = 0
+                end = last_block_size
+                center = start + (end - start) // 2
+            else:
+                start = nqubits - last_block_size
+                end = nqubits
+                center = start + (end - start) // 2
+            self.h(center)
+            for j in reversed(range(start, center)):
+                self.cx(j+1, j)
+            for j in range(center, end-1):
+                self.cx(j, j+1)
+        self.s(range(nqubits))
+
+def TMeasurement(nqubits, block_size, reverse=False):
+    qc = TStabilizer(nqubits, block_size, reverse=reverse)
+    return qc.inverse()
+
+class SingleBodyStabilizer(QuantumCircuit):
+    def __init__(self, nqubits, block_size, batch_block, reverse=False):
+        super().__init__(nqubits)
+        if nqubits < 2:
+            raise ValueError("nqubits must be at least 2 for GHZ state preparation.")
+        if block_size < 2:
+            raise ValueError(f"Block size = {block_size} must be at least 2 for GHZ state preparation.")
+        block_number = nqubits // block_size + (1 if nqubits % block_size != 0 else 0)
+        if batch_block >= block_number:
+            raise ValueError("batch_block index must be less than the number of blocks.")
+        for i in range(block_number - (1 if nqubits % block_size != 0 else 0)):
+            if reverse:
+                start = nqubits - (i + 1) * block_size
+                end = nqubits - i * block_size
+                center = start + block_size // 2
+                if i == block_number - 1 - batch_block:
+                    self.sx(center)
+                else:
+                    self.h(center)
+            else:
+                start = i * block_size
+                end = start + block_size
+                center = start + block_size // 2
+                if i == batch_block:
+                    self.sx(center)
+                else:
+                    self.h(center)
+            for j in reversed(range(start, center)):
+                self.cx(j+1, j)
+            for j in range(center, end-1):
+                self.cx(j, j+1)
+        if reverse:
+            self.s(np.arange(nqubits - (block_number - 1) * block_size, nqubits))
+        else:
+            self.s(np.arange((i+1)*block_size))
+
+        if (last_block_size := nqubits % block_size) != 0:
+            if reverse:
+                start = 0
+                end = last_block_size
+                center = start + (end - start) // 2
+                if last_block_size > 1:
+                    if (i+1 == block_number - 1 - batch_block):
+                        self.sx(center)
+                    else:
+                        self.h(center)
+            else:
+                start = nqubits - last_block_size
+                end = nqubits
+                center = start + (end - start) // 2
+                if last_block_size > 1:
+                    if i+1 == batch_block:
+                        self.sx(center)
+                    else:
+                        self.h(center)
+            for j in reversed(range(start, center)):
+                self.cx(j+1, j)
+            for j in range(center, end-1):
+                self.cx(j, j+1)
+            if last_block_size == 1:
+                if reverse:
+                    self.h(0)
+                    if not (i+1 == block_number - 1 - batch_block):
+                        self.s(0)
+                else:
+                    self.h(nqubits-1)
+                    if not (i+1 == batch_block):
+                        self.s(nqubits-1)
+            else:
+                if reverse:
+                    self.s(np.arange(0, last_block_size))
+                else:
+                    self.s(np.arange(nqubits - last_block_size, nqubits))
+    
+
+def SingleBodyMeasurement(nqubits, block_size, batch_block, reverse=False):
+    qc = SingleBodyStabilizer(nqubits, block_size, batch_block, reverse=reverse)
+    return qc.inverse()
+
+class InteractionStabilizer(QuantumCircuit):
+    def __init__(self, nqubits, block_size, batch_block, offset=0, reverse=False):
+        super().__init__(nqubits)
+        if nqubits < 2:
+            raise ValueError("nqubits must be at least 2 for GHZ state preparation.")
+        if block_size < 2:
+            raise ValueError(f"Block size = {block_size} must be at least 2 for GHZ state preparation.")
+        block_number = (nqubits - offset) // block_size + (1 if (nqubits - offset) % block_size != 0 else 0)
+        if batch_block >= block_number:
+            raise ValueError("batch_block index must be less than the number of blocks.")
+        if offset > block_size:
+            raise ValueError(f"Offset = {offset} must be less than or equal to block size = {block_size}.")
+        if offset > 1:
+            if reverse:
+                start = nqubits - offset
+                end = nqubits
+                center = start + (end - start) // 2
+            else:
+                start = 0
+                end = offset
+                center = start + (end - start) // 2
+            self.h(center)
+            for j in reversed(range(start, center)):
+                self.cx(j+1, j)
+            for j in range(center, end-1):
+                self.cx(j, j+1)
+            self.s(np.arange(start, end))
+        elif offset == 1:
+            if reverse:
+                self.h(nqubits-1)
+                self.s(nqubits-1)
+            else:
+                self.h(0)
+                self.s(0)
+
+        for i in range(block_number - (1 if (nqubits - offset) % block_size != 0 else 0)):
+            if reverse:
+                start = nqubits - offset - (i + 1) * block_size
+                end = start + block_size
+                center = start + block_size // 2
+            else:
+                start = max(i * block_size + offset, 0)
+                end = start + block_size + (min(0, offset) if i == 0 else 0)
+                center = start + block_size // 2
+            self.h(center)
+            for j in reversed(range(start, center)):
+                self.cx(j+1, j)
+            for j in range(center, end-1):
+                self.cx(j, j+1)
+            if reverse:
+                if i == block_number - 1 - batch_block:
+                    self.h(np.arange(start, end))
+                else:
+                    self.s(np.arange(start, end))
+            else:
+                if i == batch_block:
+                    self.h(np.arange(start, end))
+                else:
+                    self.s(np.arange(start, end))
+
+        if (last_block_size := (nqubits - offset) % block_size) != 0:
+            if last_block_size > 1:
+                if reverse:
+                    start = 0
+                    end = last_block_size
+                    center = start + (end - start) // 2
+                    self.h(center)
+                else:
+                    start = nqubits - last_block_size
+                    end = nqubits
+                    center = start + (end - start) // 2
+                    self.h(center)
+                for j in reversed(range(start, center)):
+                    self.cx(j+1, j)
+                for j in range(center, end-1):
+                    self.cx(j, j+1)
+                if reverse:
+                    if i+1 == block_number - 1 - batch_block:
+                        self.h(np.arange(start, end))
+                    else:
+                        self.s(np.arange(start, end))
+                else:
+                    if i+1 == batch_block:
+                        self.h(np.arange(start, end))
+                    else:
+                        self.s(np.arange(start, end))
+            else:
+                if reverse:
+                    self.h(0)
+                    self.s(0)
+                else:
+                    self.h(nqubits-1)
+                    self.s(nqubits-1)
+
+def InteractionMeasurement(nqubits, block_size, batch_block, offset=0, reverse=False):
+    qc = InteractionStabilizer(nqubits, block_size, batch_block, offset=offset, reverse=reverse)
+    return qc.inverse()
 
 def workflow(job_samples, cal_samples, job_data, confidence=None,
              return_samples=False, verbose=False):
@@ -211,6 +432,310 @@ def workflow(job_samples, cal_samples, job_data, confidence=None,
     # DEBUG
     # to_return = [[clean_obsexp_T], [cal_obsexp_T], [raw_job_obsexp_T]]
     # return to_return
+
+    if verbose: print(f"\rLoaded {len(job_samples.flatten()) + len(cal_samples.flatten())} jobs".ljust(100))
+    to_return = [[[clean_obsexp_T, clean_obsexp_sb, clean_obsexp_int],
+                 [cal_obsexp_T, cal_obsexp_sb, cal_obsexp_int],
+                 [raw_job_obsexp_T, raw_job_obsexp_sb, raw_job_obsexp_int]]]
+    if confidence is not None:
+        to_return.append([[clean_obsexp_conf_T, clean_obsexp_conf_sb, clean_obsexp_conf_int],
+                          [cal_obsexp_conf_T, cal_obsexp_conf_sb, cal_obsexp_conf_int],
+                          [raw_job_obsexp_conf_T, raw_job_obsexp_conf_sb, raw_job_obsexp_conf_int]])
+    if return_samples:
+        to_return.append([job_samples, cal_samples])
+    return to_return if len(to_return) > 1 else to_return[0]
+
+def workflow_calpercirc(job_samples, cal_samples, job_data, confidence=None,
+             return_samples=False, verbose=False):
+    jobs_shape = job_samples.shape
+    cal_shape = cal_samples.shape
+    if jobs_shape[1] != cal_shape[1]:
+        raise ValueError("job_samples and cal_samples must have the same number of columns")
+    
+    for samples in job_samples.flatten():
+        try:
+            nqubits = len(list(samples.keys())[0])
+            break
+        except IndexError:
+            continue
+    else:
+        raise ValueError("Every job_samples entry is empty, unvalid batch")
+
+    try:
+        sim_dobservables_T = job_data['sim_dobservables_T']
+        sim_dobservables_sb = job_data['sim_dobservables_sb']
+        sim_dobservables_int = job_data['sim_dobservables_int']
+    except KeyError as e:
+        raise KeyError(f"Missing required job_data key: {e}")
+    sim_dobservables_T = [[Pauli(op) for op in group] for group in job_data['sim_dobservables_T']]
+    sim_dobservables_sb = [[Pauli(op) for op in group] for group in job_data['sim_dobservables_sb']]
+    sim_dobservables_int = [[Pauli(op) for op in group] for group in job_data['sim_dobservables_int']]
+    sim_dobservables = sim_dobservables_T + sim_dobservables_sb + sim_dobservables_int
+    if any(not measure.is_diagonal(op) for op in miscutils.iterate_nested_list(sim_dobservables)):
+        raise WorkflowError("The observables in 'sim_dobservables' are not all diagonal in the Z basis")
+    if any(len(op) != nqubits for op in miscutils.iterate_nested_list(sim_dobservables)):
+        raise WorkflowError("The observables in 'sim_dobservables' do not all match the number of qubits in the samples")
+    if len(sim_dobservables) != jobs_shape[0]:
+        raise WorkflowError("'sim_dobservables' length does not match the rows of job samples")
+    sim_dobservables_T = miscutils.to_padded_array(sim_dobservables_T, fill_value=np.nan, dtype=object)
+    sim_dobservables_sb = miscutils.to_padded_array(sim_dobservables_sb, fill_value=np.nan, dtype=object)
+    sim_dobservables_int = miscutils.to_padded_array(sim_dobservables_int, fill_value=np.nan, dtype=object)
+    sim_dobservables = miscutils.to_padded_array(sim_dobservables, fill_value=np.nan, dtype=object)
+
+    try:
+        cal_dobservables_T = job_data['cal_dobservables_T']
+        cal_dobservables_sb = job_data['cal_dobservables_sb']
+        cal_dobservables_int = job_data['cal_dobservables_int']
+    except KeyError as e:
+        raise KeyError(f"Missing required job_data key: {e}")
+    cal_dobservables_T = [[Pauli(op) for op in group] for group in job_data['cal_dobservables_T']]
+    cal_observables_T_weights = [[measure.pauli_weight(op) for op in group] for group in cal_dobservables_T]
+    cal_dobservables_sb = [[Pauli(op) for op in group] for group in job_data['cal_dobservables_sb']]
+    cal_observables_sb_weights = [[measure.pauli_weight(op) for op in group] for group in cal_dobservables_sb]
+    cal_dobservables_int = [[Pauli(op) for op in group] for group in job_data['cal_dobservables_int']]
+    cal_observables_int_weights = [[measure.pauli_weight(op) for op in group] for group in cal_dobservables_int]
+    cal_dobservables = cal_dobservables_T + cal_dobservables_sb + cal_dobservables_int
+    if any(not measure.is_diagonal(op) for op in miscutils.iterate_nested_list(cal_dobservables)):
+        raise WorkflowError("The observables in 'cal_dobservables' are not all diagonal in the Z basis")
+    if any(len(op) != nqubits for op in miscutils.iterate_nested_list(cal_dobservables)):
+        raise WorkflowError("The observables in 'cal_dobservables' do not all match the number of qubits in the samples")
+    if len(cal_dobservables) != cal_shape[0]:
+        raise WorkflowError("'cal_dobservables' length does not match the rows of job samples")
+    cal_dobservables_T = miscutils.to_padded_array(cal_dobservables_T, fill_value=np.nan, dtype=object)
+    cal_dobservables_sb = miscutils.to_padded_array(cal_dobservables_sb, fill_value=np.nan, dtype=object)
+    cal_dobservables_int = miscutils.to_padded_array(cal_dobservables_int, fill_value=np.nan, dtype=object)
+    cal_dobservables = miscutils.to_padded_array(cal_dobservables, fill_value=np.nan, dtype=object)
+
+    try:
+        odr_expected_observables_T = job_data["odr_expected_observables_T"]
+        odr_expected_observables_sb = job_data["odr_expected_observables_sb"]
+        odr_expected_observables_int = job_data["odr_expected_observables_int"]
+    except KeyError:
+        raise KeyError(f"Missing required job_data key: {e}")
+    odr_expected_observables = odr_expected_observables_T + odr_expected_observables_sb + odr_expected_observables_int
+    odr_expected_observables = miscutils.to_padded_array(odr_expected_observables, fill_value=np.nan, dtype=float)
+    if odr_expected_observables.shape != cal_dobservables.shape:
+        raise WorkflowError("'odr_expected_observables' shape does not match 'cal_dobservables' shape")
+
+    job_samples_T = job_samples[:1, :]
+    job_samples_sb = job_samples[1:1+sim_dobservables_sb.shape[0], :]
+    job_samples_int = job_samples[1+sim_dobservables_sb.shape[0]:, :]
+    cal_samples_T = cal_samples[:1, :]
+    cal_samples_sb = cal_samples[1:1+cal_dobservables_sb.shape[0], :]
+    cal_samples_int = cal_samples[1+cal_dobservables_sb.shape[0]:, :]
+
+    # Measure raw job observables
+    if verbose: print("\rMeasuring job observables...".ljust(100), end="")
+    raw_job_obsexp_T, raw_job_obsexp_conf_T = measure.many_measure_diagonal_observables(job_samples_T, sim_dobservables_T[0], confidence=0 if confidence is None else confidence)
+    raw_job_obsexp_sb = np.full((*job_samples_sb.shape, sim_dobservables_sb.shape[1]), np.nan)
+    raw_job_obsexp_conf_sb = np.full((*job_samples_sb.shape, sim_dobservables_sb.shape[1], 2), np.nan)
+    for i in range(job_samples_sb.shape[0]):
+        last_obs_ind = len([obs for obs in sim_dobservables_sb[i, :] if obs is not np.nan])
+        raw_job_obsexp_sb[i, :, :last_obs_ind], raw_job_obsexp_conf_sb[i, :, :last_obs_ind, :] = measure.many_measure_diagonal_observables(job_samples_sb[i, :], sim_dobservables_sb[i, :last_obs_ind], confidence=0 if confidence is None else confidence)
+    raw_job_obsexp_int = np.full((*job_samples_int.shape, sim_dobservables_int.shape[1]), np.nan)
+    raw_job_obsexp_conf_int = np.full((*job_samples_int.shape, sim_dobservables_int.shape[1], 2), np.nan)
+    for i in range(job_samples_int.shape[0]):
+        last_obs_ind = len([obs for obs in sim_dobservables_int[i, :] if obs is not np.nan])
+        raw_job_obsexp_int[i, :, :last_obs_ind], raw_job_obsexp_conf_int[i, :, :last_obs_ind, :] = measure.many_measure_diagonal_observables(job_samples_int[i, :], sim_dobservables_int[i, :last_obs_ind], confidence=0 if confidence is None else confidence)
+    
+    # Measure calibration observables
+    if verbose: print("\rMeasuring job observables...".ljust(100), end="")
+    cal_obsexp_T, cal_obsexp_conf_T = measure.many_measure_diagonal_observables(cal_samples_T, cal_dobservables_T[0], confidence=0 if confidence is None else confidence)
+    p_arr_T = odr.compute_depolarizing_probability(cal_obsexp_T, odr_expected_observables_T, 0, nqubits)
+    cal_obsexp_sb = np.full((*cal_samples_sb.shape, cal_dobservables_sb.shape[1]), np.nan)
+    cal_obsexp_conf_sb = np.full((*cal_samples_sb.shape, cal_dobservables_sb.shape[1], 2), np.nan)
+    p_arr_sb = np.full_like(cal_obsexp_sb, np.nan)
+    for i in range(cal_samples_sb.shape[0]):
+        last_obs_ind = len([obs for obs in cal_dobservables_sb[i, :] if obs is not np.nan])
+        cal_obsexp_sb[i, :, :last_obs_ind], cal_obsexp_conf_sb[i, :, :last_obs_ind, :] = measure.many_measure_diagonal_observables(cal_samples_sb[i, :], cal_dobservables_sb[i, :last_obs_ind], confidence=0 if confidence is None else confidence)
+        p_arr_sb[i, :] = odr.compute_depolarizing_probability(cal_obsexp_sb[i, :, :last_obs_ind], odr_expected_observables_sb[i][:last_obs_ind], 0, nqubits)
+    
+    cal_obsexp_int = np.full((*cal_samples_int.shape, cal_dobservables_int.shape[1]), np.nan)
+    cal_obsexp_conf_int = np.full((*cal_samples_int.shape, cal_dobservables_int.shape[1], 2), np.nan)
+    p_arr_int = np.full_like(cal_obsexp_int, np.nan)
+    for i in range(cal_samples_int.shape[0]):
+        last_obs_ind = len([obs for obs in cal_dobservables_int[i, :] if obs is not np.nan])
+        cal_obsexp_int[i, :, :last_obs_ind], cal_obsexp_conf_int[i, :, :last_obs_ind, :] = measure.many_measure_diagonal_observables(cal_samples_int[i, :], cal_dobservables_int[i, :last_obs_ind], confidence=0 if confidence is None else confidence)
+        p_arr_int[i, :] = odr.compute_depolarizing_probability(cal_obsexp_int[i, :, :last_obs_ind], odr_expected_observables_int[i][:last_obs_ind], 0, nqubits)
+    
+    # Renormalize calibration observables
+    clean_obsexp_T = np.full_like(raw_job_obsexp_T, np.nan)
+    clean_obsexp_conf_T = np.full_like(raw_job_obsexp_conf_T, np.nan)
+    for i in range(sim_dobservables_T.shape[0]):
+        for j in range(sim_dobservables_T.shape[1]):
+            if sim_dobservables_T[i, j] is not np.nan:
+                this_obs_weight = measure.pauli_weight(sim_dobservables_T[i, j])
+                cal_weight_index = cal_observables_T_weights[i].index(this_obs_weight)
+                clean_obsexp_T[i, :, j], clean_obsexp_conf_T[i, :, j, :] = odr.renormalize_observable(raw_job_obsexp_T[i, :, j], p_arr_T[i, :, cal_weight_index], 0, nqubits, observable_range=None, expected_observable_arr=odr_expected_observables_T[i][cal_weight_index], observable_confidence=raw_job_obsexp_conf_T[i, :, j, :])
+
+    clean_obsexp_sb = np.full_like(raw_job_obsexp_sb, np.nan)
+    clean_obsexp_conf_sb = np.full_like(raw_job_obsexp_conf_sb, np.nan)
+    for i in range(sim_dobservables_sb.shape[0]):
+        for j in range(sim_dobservables_sb.shape[1]):
+            if sim_dobservables_sb[i, j] is not np.nan:
+                this_obs_weight = measure.pauli_weight(sim_dobservables_sb[i, j])
+                cal_weight_index = cal_observables_sb_weights[i].index(this_obs_weight)
+                clean_obsexp_sb[i, :, j], clean_obsexp_conf_sb[i, :, j, :] = odr.renormalize_observable(raw_job_obsexp_sb[i, :, j], p_arr_sb[i, :, cal_weight_index], 0, nqubits, observable_range=None, expected_observable_arr=odr_expected_observables_sb[i][cal_weight_index], observable_confidence=raw_job_obsexp_conf_sb[i, :, j, :])
+
+    clean_obsexp_int = np.full_like(raw_job_obsexp_int, np.nan)
+    clean_obsexp_conf_int = np.full_like(raw_job_obsexp_conf_int, np.nan)
+    for i in range(sim_dobservables_int.shape[0]):
+        for j in range(sim_dobservables_int.shape[1]):
+            if sim_dobservables_int[i, j] is not np.nan:
+                this_obs_weight = measure.pauli_weight(sim_dobservables_int[i, j])
+                cal_weight_index = cal_observables_int_weights[i].index(this_obs_weight)
+                clean_obsexp_int[i, :, j], clean_obsexp_conf_int[i, :, j, :] = odr.renormalize_observable(raw_job_obsexp_int[i, :, j], p_arr_int[i, :, cal_weight_index], 0, nqubits, observable_range=None, expected_observable_arr=odr_expected_observables_int[i][cal_weight_index], observable_confidence=raw_job_obsexp_conf_int[i, :, j, :])
+
+    # DEBUG
+    # to_return = [[clean_obsexp_T], [cal_obsexp_T], [raw_job_obsexp_T]]
+    # return to_return
+
+    if verbose: print(f"\rLoaded {len(job_samples.flatten()) + len(cal_samples.flatten())} jobs".ljust(100))
+    to_return = [[[clean_obsexp_T, clean_obsexp_sb, clean_obsexp_int],
+                 [cal_obsexp_T, cal_obsexp_sb, cal_obsexp_int],
+                 [raw_job_obsexp_T, raw_job_obsexp_sb, raw_job_obsexp_int]]]
+    if confidence is not None:
+        to_return.append([[clean_obsexp_conf_T, clean_obsexp_conf_sb, clean_obsexp_conf_int],
+                          [cal_obsexp_conf_T, cal_obsexp_conf_sb, cal_obsexp_conf_int],
+                          [raw_job_obsexp_conf_T, raw_job_obsexp_conf_sb, raw_job_obsexp_conf_int]])
+    if return_samples:
+        to_return.append([job_samples, cal_samples])
+    return to_return if len(to_return) > 1 else to_return[0]
+
+def workflow_ghz(job_samples, cal_samples, job_data, confidence=None,
+                 return_samples=False, verbose=False):
+    jobs_shape = job_samples.shape
+    cal_shape = cal_samples.shape
+    if jobs_shape[1] != cal_shape[1]:
+        raise ValueError("job_samples and cal_samples must have the same number of columns")
+    
+    for samples in job_samples.flatten():
+        try:
+            nqubits = len(list(samples.keys())[0])
+            break
+        except IndexError:
+            continue
+    else:
+        raise ValueError("Every job_samples entry is empty, unvalid batch")
+
+    try:
+        sim_dobservables_T = job_data['sim_dobservables_T']
+        sim_dobservables_sb = job_data['sim_dobservables_sb']
+        sim_dobservables_int = job_data['sim_dobservables_int']
+    except KeyError as e:
+        raise KeyError(f"Missing required job_data key: {e}")
+    sim_dobservables_T = [[Pauli(op) for op in group] for group in job_data['sim_dobservables_T']]
+    sim_dobservables_sb = [[Pauli(op) for op in group] for group in job_data['sim_dobservables_sb']]
+    sim_dobservables_int = [[Pauli(op) for op in group] for group in job_data['sim_dobservables_int']]
+    sim_dobservables = sim_dobservables_T + sim_dobservables_sb + sim_dobservables_int
+    if any(not measure.is_diagonal(op) for op in miscutils.iterate_nested_list(sim_dobservables)):
+        raise WorkflowError("The observables in 'sim_dobservables' are not all diagonal in the Z basis")
+    if any(len(op) != nqubits for op in miscutils.iterate_nested_list(sim_dobservables)):
+        raise WorkflowError("The observables in 'sim_dobservables' do not all match the number of qubits in the samples")
+    if len(sim_dobservables) != jobs_shape[0]:
+        raise WorkflowError("'sim_dobservables' length does not match the rows of job samples")
+    sim_dobservables_T = miscutils.to_padded_array(sim_dobservables_T, fill_value=np.nan, dtype=object)
+    sim_dobservables_sb = miscutils.to_padded_array(sim_dobservables_sb, fill_value=np.nan, dtype=object)
+    sim_dobservables_int = miscutils.to_padded_array(sim_dobservables_int, fill_value=np.nan, dtype=object)
+    sim_dobservables = miscutils.to_padded_array(sim_dobservables, fill_value=np.nan, dtype=object)
+
+    try:
+        cal_dobservables_T = job_data['cal_dobservables_T']
+        cal_dobservables_sb = job_data['cal_dobservables_sb']
+        cal_dobservables_int = job_data['cal_dobservables_int']
+    except KeyError as e:
+        raise KeyError(f"Missing required job_data key: {e}")
+    cal_dobservables_T = [[Pauli(op) for op in group] for group in job_data['cal_dobservables_T']]
+    cal_observables_T_weights = [[measure.pauli_weight(op) for op in group] for group in cal_dobservables_T]
+    cal_dobservables_sb = [[Pauli(op) for op in group] for group in job_data['cal_dobservables_sb']]
+    cal_observables_sb_weights = [[measure.pauli_weight(op) for op in group] for group in cal_dobservables_sb]
+    cal_dobservables_int = [[Pauli(op) for op in group] for group in job_data['cal_dobservables_int']]
+    cal_observables_int_weights = [[measure.pauli_weight(op) for op in group] for group in cal_dobservables_int]
+    cal_dobservables = cal_dobservables_T + cal_dobservables_sb + cal_dobservables_int
+    if any(not measure.is_diagonal(op) for op in miscutils.iterate_nested_list(cal_dobservables)):
+        raise WorkflowError("The observables in 'cal_dobservables' are not all diagonal in the Z basis")
+    if any(len(op) != nqubits for op in miscutils.iterate_nested_list(cal_dobservables)):
+        raise WorkflowError("The observables in 'cal_dobservables' do not all match the number of qubits in the samples")
+    if len(cal_dobservables) != cal_shape[0]:
+        raise WorkflowError("'cal_dobservables' length does not match the rows of job samples")
+    cal_dobservables_T = miscutils.to_padded_array(cal_dobservables_T, fill_value=np.nan, dtype=object)
+    cal_dobservables_sb = miscutils.to_padded_array(cal_dobservables_sb, fill_value=np.nan, dtype=object)
+    cal_dobservables_int = miscutils.to_padded_array(cal_dobservables_int, fill_value=np.nan, dtype=object)
+    cal_dobservables = miscutils.to_padded_array(cal_dobservables, fill_value=np.nan, dtype=object)
+
+    try:
+        odr_expected_observables_T = job_data["odr_expected_observables_T"]
+        odr_expected_observables_sb = job_data["odr_expected_observables_sb"]
+        odr_expected_observables_int = job_data["odr_expected_observables_int"]
+    except KeyError:
+        raise KeyError(f"Missing required job_data key: {e}")
+    odr_expected_observables = odr_expected_observables_T + odr_expected_observables_sb + odr_expected_observables_int
+    odr_expected_observables = miscutils.to_padded_array(odr_expected_observables, fill_value=np.nan, dtype=float)
+    if odr_expected_observables.shape != cal_dobservables.shape:
+        raise WorkflowError("'odr_expected_observables' shape does not match 'cal_dobservables' shape")
+
+    job_samples_T = job_samples[:1, :]
+    job_samples_sb = job_samples[1:1+sim_dobservables_sb.shape[0], :]
+    job_samples_int = job_samples[1+sim_dobservables_sb.shape[0]:, :]
+    cal_samples_T = cal_samples[:1, :]
+    cal_samples_sb = cal_samples[1:1+cal_dobservables_sb.shape[0], :]
+    cal_samples_int = cal_samples[1+cal_dobservables_sb.shape[0]:, :]
+
+    # Measure raw job observables
+    if verbose: print("\rMeasuring job observables...".ljust(100), end="")
+    raw_job_obsexp_T, raw_job_obsexp_conf_T = measure.many_measure_diagonal_observables(job_samples_T, sim_dobservables_T[0], confidence=0 if confidence is None else confidence)
+    raw_job_obsexp_sb = np.full((*job_samples_sb.shape, sim_dobservables_sb.shape[1]), np.nan)
+    raw_job_obsexp_conf_sb = np.full((*job_samples_sb.shape, sim_dobservables_sb.shape[1], 2), np.nan)
+    for i in range(job_samples_sb.shape[0]):
+        last_obs_ind = len([obs for obs in sim_dobservables_sb[i, :] if obs is not np.nan])
+        raw_job_obsexp_sb[i, :, :last_obs_ind], raw_job_obsexp_conf_sb[i, :, :last_obs_ind, :] = measure.many_measure_diagonal_observables(job_samples_sb[i, :], sim_dobservables_sb[i, :last_obs_ind], confidence=0 if confidence is None else confidence)
+    raw_job_obsexp_int = np.full((*job_samples_int.shape, sim_dobservables_int.shape[1]), np.nan)
+    raw_job_obsexp_conf_int = np.full((*job_samples_int.shape, sim_dobservables_int.shape[1], 2), np.nan)
+    for i in range(job_samples_int.shape[0]):
+        last_obs_ind = len([obs for obs in sim_dobservables_int[i, :] if obs is not np.nan])
+        raw_job_obsexp_int[i, :, :last_obs_ind], raw_job_obsexp_conf_int[i, :, :last_obs_ind, :] = measure.many_measure_diagonal_observables(job_samples_int[i, :], sim_dobservables_int[i, :last_obs_ind], confidence=0 if confidence is None else confidence)
+    
+    # Measure calibration observables
+    if verbose: print("\rMeasuring job observables...".ljust(100), end="")
+    cal_obsexp_T, cal_obsexp_conf_T = measure.many_measure_diagonal_observables(cal_samples_T, cal_dobservables_T[0], confidence=0 if confidence is None else confidence)
+    p_arr_T = odr.compute_depolarizing_probability(cal_obsexp_T, odr_expected_observables_T, 0, nqubits)
+    cal_obsexp_sb = np.full((*cal_samples_sb.shape, cal_dobservables_sb.shape[1]), np.nan)
+    cal_obsexp_conf_sb = np.full((*cal_samples_sb.shape, cal_dobservables_sb.shape[1], 2), np.nan)
+    p_arr_sb = np.full_like(cal_obsexp_sb, np.nan)
+    for i in range(cal_samples_sb.shape[0]):
+        last_obs_ind = len([obs for obs in cal_dobservables_sb[i, :] if obs is not np.nan])
+        cal_obsexp_sb[i, :, :last_obs_ind], cal_obsexp_conf_sb[i, :, :last_obs_ind, :] = measure.many_measure_diagonal_observables(cal_samples_sb[i, :], cal_dobservables_sb[i, :last_obs_ind], confidence=0 if confidence is None else confidence)
+        p_arr_sb[i, :, :last_obs_ind] = odr.compute_depolarizing_probability(cal_obsexp_sb[i, :, :last_obs_ind], odr_expected_observables_sb[i][:last_obs_ind], 0, nqubits)
+
+    cal_obsexp_int = np.full((*cal_samples_int.shape, cal_dobservables_int.shape[1]), np.nan)
+    cal_obsexp_conf_int = np.full((*cal_samples_int.shape, cal_dobservables_int.shape[1], 2), np.nan)
+    p_arr_int = np.full_like(cal_obsexp_int, np.nan)
+    for i in range(cal_samples_int.shape[0]):
+        last_obs_ind = len([obs for obs in cal_dobservables_int[i, :] if obs is not np.nan])
+        cal_obsexp_int[i, :, :last_obs_ind], cal_obsexp_conf_int[i, :, :last_obs_ind, :] = measure.many_measure_diagonal_observables(cal_samples_int[i, :], cal_dobservables_int[i, :last_obs_ind], confidence=0 if confidence is None else confidence)
+        p_arr_int[i, :, :last_obs_ind] = odr.compute_depolarizing_probability(cal_obsexp_int[i, :, :last_obs_ind], odr_expected_observables_int[i][:last_obs_ind], 0, nqubits)
+    
+    # Renormalize calibration observables
+    clean_obsexp_T = np.full_like(raw_job_obsexp_T, np.nan)
+    clean_obsexp_conf_T = np.full_like(raw_job_obsexp_conf_T, np.nan)
+    for i in range(sim_dobservables_T.shape[0]):
+        for j in range(sim_dobservables_T.shape[1]):
+            if sim_dobservables_T[i, j] is not np.nan:
+                clean_obsexp_T[i, :, j], clean_obsexp_conf_T[i, :, j, :] = odr.renormalize_observable(raw_job_obsexp_T[i, :, j], p_arr_T[i, :, j], 0, nqubits, observable_range=None, expected_observable_arr=odr_expected_observables_T[i][j], observable_confidence=raw_job_obsexp_conf_T[i, :, j, :])
+
+    clean_obsexp_sb = np.full_like(raw_job_obsexp_sb, np.nan)
+    clean_obsexp_conf_sb = np.full_like(raw_job_obsexp_conf_sb, np.nan)
+    for i in range(sim_dobservables_sb.shape[0]):
+        for j in range(sim_dobservables_sb.shape[1]):
+            if sim_dobservables_sb[i, j] is not np.nan:
+                clean_obsexp_sb[i, :, j], clean_obsexp_conf_sb[i, :, j, :] = odr.renormalize_observable(raw_job_obsexp_sb[i, :, j], p_arr_sb[i, :, j], 0, nqubits, observable_range=None, expected_observable_arr=odr_expected_observables_sb[i][j], observable_confidence=raw_job_obsexp_conf_sb[i, :, j, :])
+
+    clean_obsexp_int = np.full_like(raw_job_obsexp_int, np.nan)
+    clean_obsexp_conf_int = np.full_like(raw_job_obsexp_conf_int, np.nan)
+    for i in range(sim_dobservables_int.shape[0]):
+        for j in range(sim_dobservables_int.shape[1]):
+            if sim_dobservables_int[i, j] is not np.nan:
+                clean_obsexp_int[i, :, j], clean_obsexp_conf_int[i, :, j, :] = odr.renormalize_observable(raw_job_obsexp_int[i, :, j], p_arr_int[i, :, j], 0, nqubits, observable_range=None, expected_observable_arr=odr_expected_observables_int[i][j], observable_confidence=raw_job_obsexp_conf_int[i, :, j, :])
 
     if verbose: print(f"\rLoaded {len(job_samples.flatten()) + len(cal_samples.flatten())} jobs".ljust(100))
     to_return = [[[clean_obsexp_T, clean_obsexp_sb, clean_obsexp_int],
