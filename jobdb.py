@@ -1,4 +1,5 @@
 from qiskit_ibm_runtime.exceptions import RuntimeJobFailureError, RuntimeInvalidStateError
+from qiskit_ibm_runtime.quantum_program.quantum_program_result import QuantumProgramResult
 from qiskit_ibm_runtime import RuntimeDecoder, RuntimeEncoder
 from utils.samples import group_multirep_samples_dicts
 import utils.execution as execution
@@ -33,9 +34,9 @@ class ExecDB:
         for i, batch in enumerate(self._data[::-1]):
             is_equal = ([
                 batch.get(key, None) == val for key, val in batch_args.items()
-            ] + [
-                batch["observables_func_name"] == observable_func_name
-            ])
+            ])# + [
+            #    batch["observables_func_name"] == observable_func_name
+            #])
             if all(is_equal): indices_to_return.append(len(self._data) - 1 - i)
             if len(indices_to_return) >= limit: break
         return indices_to_return
@@ -204,7 +205,7 @@ def save_job_result(filepath, job):
         json.dump(result, f, cls=RuntimeEncoder)
     return result
     
-def load_results_from_local_or_ibmq(job_ids, ibmq_service, jobs_result_folder, verbose=False):
+def load_results_from_local_or_ibmq(job_ids, ibmq_service, jobs_result_folder="", verbose=False):
     job_results = []
     for job_id in job_ids:
         if verbose: print(f"\rLoading job {job_id}...".ljust(100), end="")
@@ -242,6 +243,9 @@ def samples_from_result(job_result):
     # return samples
     if job_result is None:
         return [{}]
+    elif isinstance(job_result, QuantumProgramResult):
+        samples = [res for res in job_result]
+        return samples
     else:
         samples = [list(dict(res.data).values())[0].get_counts() for res in job_result]
         return samples

@@ -311,7 +311,6 @@ def znepea_options_check(options_dict):
         "noise_factors",
         "pt_num_randomizations",
         "pt_shots_per_randomization",
-        "noise_factors"
     ]
     for key in required_keys:
         if key not in options_dict:
@@ -319,7 +318,8 @@ def znepea_options_check(options_dict):
 
 def diagobs_noise_amplification_argument_generator(samplex, parameter_values, noise_maps, noise_rates):
     samplex_accepted_arguments = [spec for spec in samplex.inputs().specs]
-    samplex_arguments = {"pauli_lindblad_maps": noise_maps}
+    samplex_arguments = {}
+    #{"pauli_lindblad_maps": noise_maps}
     for spec in samplex_accepted_arguments:
         if "basis_changes" in spec.name:
             samplex_arguments[spec.name] = np.full(spec.shape, 0).tolist()
@@ -327,6 +327,10 @@ def diagobs_noise_amplification_argument_generator(samplex, parameter_values, no
             samplex_arguments[spec.name] = noise_rates
         if "parameter_values" in spec.name:
             samplex_arguments[spec.name] = parameter_values
+        if "pauli_lindblad_maps" in spec.name:
+            nm_id = spec.name.split(".")[-1]
+            if nm_id in noise_maps:
+                samplex_arguments[spec.name] = noise_maps[nm_id]
     return samplex_arguments
 
 def execute_znepea_choosing_layout(backend, job_log_barrier_circuits, parameters_func, db_options, uinst_filter_func=None, job_db=None, optimization_level=3):
@@ -336,36 +340,54 @@ def execute_znepea_choosing_layout(backend, job_log_barrier_circuits, parameters
     job_log_circuits = [circutils.check_and_measure_active_qubits(c) for c in job_log_circuits.flatten()]
     batch_options = {"job_circuits_shape": job_log_circuits_shape, "cal_circuits_shape": None, "nrepetitions": 1, "repeat_cal": False}
     jobs = []
+    dummy_pm = generate_preset_pass_manager(backend=backend, optimization_level=3)
+    dummy_circ = dummy_pm.run(job_log_circuits[-1])
     with Session(backend=backend) as session:
         batch_options["batch_id"] = session.session_id
         
         # Run the layout benchmarks
         print("Running layout benchmarks...")
         target = benchmarks.update_target(backend, session)
+
+        # Run dummy job to avoid idling
+        dummy_sampler = SamplerV2(mode=session, options={"default_shots": 2**14})
+        dummy_job = dummy_sampler.run([(dummy_circ, parameters_func(1))])
+
+        # Transpile circuits
         pm = generate_preset_pass_manager(target=target, optimization_level=optimization_level)
         depths = np.array([circutils.depth2qb(c) for c in job_log_circuits])
         longest_circuit_ind = np.argmax(depths)
         transpiled_longest_circuit = pm.run(job_log_circuits[longest_circuit_ind])
         chosen_layout = transpiled_longest_circuit.layout.final_index_layout()
         job_circuits = circutils.transpile_circuits_with_consistent_layout(job_log_circuits, backend, chosen_layout)
+        # job_circuits = circutils.transpile_circuits_with_consistent_layout(job_log_circuits, backend, None)
 
         # Prepare templates, samplexes and noise injected circuits
         print("Preparing circuits for noise learning...")
-        box_job_circuits = circutils.box_circuits(job_circuits,
-                                                  enable_gates=True,
+        # box_job_circuits = circutils.box_circuits(job_circuits,
+        #                                           enable_gates=True,
+        #                                           enable_measures=True,
+        #                                           twirling_strategy="active_circuit")
+
+        box_job_circuits = circutils.box_circuits(job_circuits, 
+                                                  enable_gates=True, 
                                                   enable_measures=True,
-                                                  twirling_strategy="active_circuit")
+                                                  twirling_strategy="active_circuit",
+                                                  inject_noise_strategy="individual_modification",
+                                                  inject_noise_targets="gates",
+                                                  measure_annotations="all")
+
         box_job_circuits_unist = circutils.get_unique_boxes(box_job_circuits.tolist(), undress_boxes=True, normalize_annotations=None)
         if uinst_filter_func is not None:
             box_job_circuits_unist = uinst_filter_func(box_job_circuits_unist)
         
-        ninject_job_circuits = circutils.box_circuits(job_circuits,
-                                                      twirling_strategy="active_circuit",
-                                                      inject_noise_strategy="individual_modification",
-                                                      inject_noise_targets="gates",
-                                                      measure_annotations="all")
+        # ninject_job_circuits = circutils.box_circuits(job_circuits,
+        #                                               twirling_strategy="active_circuit",
+        #                                               inject_noise_strategy="individual_modification",
+        #                                               inject_noise_targets="gates",
+        #                                               measure_annotations="all")
 
-        templates, samplexes = circutils.samplomatic_build(ninject_job_circuits)
+        templates, samplexes = circutils.samplomatic_build(box_job_circuits)
         if db_options["learner_post_selection_enabled"]:
             # Set up post selection PM (to add PS instructions)
             post_selection_pm = PassManager(
@@ -396,13 +418,13 @@ def execute_znepea_choosing_layout(backend, job_log_barrier_circuits, parameters
         print("Submitting jobs...")
         executor = Executor(mode=session)
         for i, (template, samplex) in enumerate(zip(templates, samplexes)):
-            samplex_arguments = diagobs_noise_amplification_argument_generator(samplex, parameter_values=parameters_func(i), noise_maps=noise_maps, noise_rates=db_options["noise_rates"])
+            samplex_arguments = diagobs_noise_amplification_argument_generator(samplex, parameter_values=parameters_func(i), noise_maps=noise_maps, noise_rates=db_options["noise_factors"])
             program = QuantumProgram(shots=db_options["pt_shots_per_randomization"])
             program.append_samplex_item(
                 circuit=template,
                 samplex=samplex,
                 samplex_arguments=samplex_arguments,
-                shape=(db_options["pt_num_randomizations"],)
+                shape=(db_options["pt_num_randomizations"], len(noise_maps))
             )
             jobs.append(executor.run(program))
         

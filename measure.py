@@ -102,7 +102,7 @@ def operators_affecting_qb_range(first, last, operators, return_operator_range=F
         return PauliList(affecting_operators), (first_affected_qb, last_affected_qb)
     else:
         return PauliList(affecting_operators)
-    
+
 def count_non_diagonal_qubits(commuting_pauli_set):
     max_non_diagonal_qubits = 0
     for pauli in commuting_pauli_set:
@@ -175,7 +175,6 @@ def many_measure_diagonal_observables(samples_dicts, diagonal_observables, confi
         raise ValueError("The provided observables are not diagonal in the same basis")
     og_samples_dicts_shape = samples_dicts.shape
     samples_dicts = samples_dicts.flatten()
-    indices = np.arange(len(samples_dicts))
     if (confidence is not None) and (shots is not None):
         shots = np.array(shots)
         if shots.shape != og_samples_dicts_shape:
@@ -204,6 +203,57 @@ def many_measure_diagonal_observables(samples_dicts, diagonal_observables, confi
     else:
         expectation_values = np.array(result).reshape((*og_samples_dicts_shape, len(diagonal_observables)))
         return expectation_values
+
+def measure_observables_executor(executor_result, diagonal_observables, basis="Z", confidence=None, register_name="meas"):
+    # Executor result shape:
+    # (p_randomizations, ...custom..., parameters, shots, nregisters)
+    # Final shape
+    # (...custom..., nobservables)
+    if confidence is not None:
+        raise NotImplementedError("Confidence intervals are not implemented yet.")
+    
+    if isinstance(diagonal_observables, Pauli):
+        diagonal_observables = [diagonal_observables]
+    raw_register = executor_result[register_name]
+    correction_flips = executor_result[f"measurement_flips.{register_name}"]
+    corrected_samples = (raw_register ^ correction_flips).reshape((-1, raw_register.shape[-1]))
+
+    # strings_expectation_values = np.zeros((corrected_samples.shape[0], len(diagonal_observables)))
+    observables_mask = np.array([[int(str(opel) == basis) for opel in invert_pauli_order(observable)] for observable in diagonal_observables])
+    observables_phases = np.array([1j**obs.phase for obs in diagonal_observables])
+    if np.any(observables_phases.imag != 0):
+        raise ValueError("Diagonal observables must have +-1 phases")
+    observables_phases = observables_phases.real
+    strings_expectation_values = (corrected_samples @ observables_mask.T) % 2
+    strings_expectation_values = 1 - 2*strings_expectation_values
+    strings_expectation_values = strings_expectation_values * observables_phases
+    strings_expectation_values = strings_expectation_values.reshape((*raw_register.shape[:-1], len(diagonal_observables)))
+    expectation_values = np.mean(strings_expectation_values, axis=(0, -2))
+    return expectation_values
+
+def many_measure_observables_executor(executor_results, diagonal_observables, basis="Z", confidence=None, register_name="meas"):
+    if confidence is not None:
+        raise NotImplementedError("Confidence intervals are not implemented yet.")
+    nqubits = len(diagonal_observables[0])
+    executor_results = np.array(executor_results)
+    for observable in diagonal_observables:
+        if len(observable) != nqubits:
+            raise ValueError("All observables must act on the same number of qubits")
+    all_diagonal, basis = diagonal_operators_check(diagonal_observables)
+    if not all_diagonal:
+        raise ValueError("The provided observables are not diagonal in the same basis")
+    og_results_shape = executor_results.shape
+    executor_results = executor_results.flatten()
+    shmem = SharedMemory(create=True, size=executor_results.nbytes)
+    shared_samples = np.ndarray(executor_results.shape, dtype=object, buffer=shmem.buf)
+    shared_samples[:] = executor_results
+    measure_args = [(measure_observables_executor, shmem.name, og_results_shape, i, (diagonal_observables, basis, confidence)) for i in range(len(executor_results))]
+    with mp.get_context("fork").Pool(processes=mp.cpu_count()//2) as pool:
+        result = pool.starmap(threadsafe_samples_transfer, measure_args)
+    shmem.close()
+    shmem.unlink()
+    expectation_values = np.array(result, dtype=object).reshape((*og_results_shape, *result[0].shape))
+    return expectation_values
     
 # -----------------------------------------
 #           BASIS CHANGE CIRCUITS

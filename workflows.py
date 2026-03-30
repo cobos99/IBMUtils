@@ -444,6 +444,55 @@ def postselection_zne(job_samples, job_data, postselection_genfunc, observables_
         to_return.append([postselected_samples, job_samples])
     return to_return if len(to_return) > 1 else to_return[0]
 
+def peazne(executor_results, job_data, observables_genfuncs,
+           zne_func=znemod.perform_linear_zne,
+           confidence=None,
+           return_samples=False,
+           verbose=False):
+    if confidence is not None:
+        raise NotImplementedError("Confidence intervals are not yet implemented for peazne")
+
+    try:
+        noise_factors = np.array(job_data["noise_factors"])
+    except KeyError:
+        raise WorkflowError("job_data must contain the 'noise_factors' key")
+
+    if not isinstance(observables_genfuncs, (tuple, list)):
+        observables_genfuncs = [observables_genfuncs]
+    raw_observables_shape = (len(noise_factors), *job_data["job_circuits_shape"], len(observables_genfuncs))
+    job_results = np.array(executor_results, dtype=object).flatten()
+    succesful_jobs_mask = np.array([len(res.keys()) > 0 for res in job_results])
+    nqubits = list(job_results[0].values())[0].shape[-1]
+    diagonal_observbles_ops, non_diagonal_observables_ops = measure.generate_observables(nqubits, observables_genfuncs)
+    if non_diagonal_observables_ops:
+        raise ValueError("The provided observables are not diagonal in the Z basis")
+
+    # Measure observables
+    # TODO: Implement confidence
+    # TODO: Properly address failed jobs (compute the expected size in job_db)
+    if verbose: print("\rMeasuring diagonal observables...".ljust(100), end="")
+    raw_measured_observables = measure.many_measure_observables_executor(job_results[succesful_jobs_mask], diagonal_observbles_ops)
+    raw_measured_observables = np.swapaxes(raw_measured_observables, 0, 1)
+    raw_observables = np.full(raw_observables_shape, np.nan)
+    raw_observables[:, succesful_jobs_mask, :] = raw_measured_observables
+
+    # ZNE extrapolation
+    if verbose: print("\rPerforming ZNE extrapolation...".ljust(100), end="")
+    zne_observables = np.full(raw_observables_shape[1::], np.nan)
+    for inds in np.ndindex(raw_observables.shape[1::]):
+        observables_for_reg = raw_observables[:, *inds]
+        if np.isnan(observables_for_reg).any():
+            zne_observables[inds] = np.nan
+        else:
+            zne_results = zne_func(noise_factors, observables_for_reg)
+            zne_observables[inds] = zne_results.intercept
+    
+    if verbose: print(f"\rLoaded {len(job_results.flatten())} jobs".ljust(100))
+    to_return = [[zne_observables, raw_observables]]
+    if return_samples:
+        to_return.append(job_results)
+    return to_return if len(to_return) > 1 else to_return[0]
+
 def sum_observables_terms(observables_expectation, observables_coupling, observables_confidence=None):
     observables_coupling = miscutils.to_padded_array(observables_coupling, fill_value=np.nan, dtype=float)
     if observables_expectation.shape[::2] != observables_coupling.shape:
