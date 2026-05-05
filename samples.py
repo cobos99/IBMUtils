@@ -12,6 +12,9 @@ def combine_samples_dicts(samples_dicts):
                 final_samples_dict[state] = samples_dict[state]
     return final_samples_dict
 
+def hextobinsamples(sd, nqubits):
+    return {f"{int(k, 16):0{nqubits}b}": v for k, v in sd.items()}
+
 # def debug_combine_samples_dicts(dummy_strings):
 #     combined = dummy_strings[0]
 #     for i in dummy_strings[1::]:
@@ -57,6 +60,7 @@ def combine_samples_dicts(samples_dicts):
 #         return final_job_samples, final_cal_samples
 #     else:
 #         return final_job_samples
+
 
 def group_multirep_samples_dicts(samples_dicts, job_circuits_shape, nrepetitions, cal=False, repeat_cal=False):
     if not nrepetitions.is_integer() or nrepetitions < 1:
