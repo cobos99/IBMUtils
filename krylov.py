@@ -214,16 +214,16 @@ class InteractionStabilizer(QuantumCircuit):
             else:
                 self.h(0)
                 self.s(0)
-
+        
         for i in range(block_number - (1 if (nqubits - offset) % block_size != 0 else 0)):
             if reverse:
                 start = nqubits - offset - (i + 1) * block_size
                 end = start + block_size
-                center = start + block_size // 2
+                center = (end - start) // 2
             else:
                 start = max(i * block_size + offset, 0)
                 end = start + block_size + (min(0, offset) if i == 0 else 0)
-                center = start + block_size // 2
+                center = start + (end - start) // 2
             self.h(center)
             for j in reversed(range(start, center)):
                 self.cx(j+1, j)
@@ -239,6 +239,9 @@ class InteractionStabilizer(QuantumCircuit):
                     self.h(np.arange(start, end))
                 else:
                     self.s(np.arange(start, end))
+
+        if block_number - (1 if (nqubits - offset) % block_size != 0 else 0) == 0:
+            i = 0
 
         if (last_block_size := (nqubits - offset) % block_size) != 0:
             if last_block_size > 1:
