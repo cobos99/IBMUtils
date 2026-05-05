@@ -1,3 +1,4 @@
+from qiskit_addon_utils.noise_management.post_selection import PostSelector
 from multiprocessing.shared_memory import SharedMemory
 from hardware.utils.bootstrap import bootstrap_sample_dict_mean
 from hardware.utils.samples import threadsafe_samples_transfer
@@ -134,7 +135,7 @@ def measure_observables(samples_dict, diagonal_observables, basis="Z", confidenc
     if len(samples_dict) == 0:
         if confidence is not None:
             return np.full(len(diagonal_observables), np.nan), np.full((len(diagonal_observables), 2), np.nan)
-        else: 
+        else:
             return np.full(len(diagonal_observables), np.nan)
     strings_expectation_values = np.zeros((len(samples_dict), len(diagonal_observables)))
     observables_mask = np.array([[int(str(opel) == basis) for opel in invert_pauli_order(observable)] for observable in diagonal_observables])
@@ -230,6 +231,33 @@ def measure_observables_executor(executor_result, diagonal_observables, basis="Z
     strings_expectation_values = strings_expectation_values.reshape((*raw_register.shape[:-1], len(diagonal_observables)))
     expectation_values = np.mean(strings_expectation_values, axis=(0, -2))
     return expectation_values
+
+def measure_observables_postselection(executor_result, circuit, backend, diagonal_observables, trex_scale_factors=None, postselection_strategy="edge", basis="Z", register_name="meas"):
+    if isinstance(diagonal_observables, Pauli):
+        diagonal_observables = [diagonal_observables]
+    post_selector = PostSelector.from_circuit(circuit, coupling_map=backend.coupling_map)
+    mask = post_selector.compute_mask(executor_result, strategy=postselection_strategy)
+    num_shots_kept = np.sum(mask, axis=-1)
+    if trex_scale_factors is None:
+        trex_scale_factors = np.ones(len(diagonal_observables))
+    if isinstance(diagonal_observables, Pauli):
+        diagonal_observables = [diagonal_observables]
+    raw_register = executor_result[register_name]
+    correction_flips = executor_result[f"measurement_flips.{register_name}"]
+    corrected_samples = (raw_register ^ correction_flips).reshape((-1, raw_register.shape[-1]))
+    # flagged_samples = np.concatenate((corrected_samples, mask[..., np.newaxis]), axis=-1) # Flag is last bit
+
+    observables_mask = np.array([[int(str(opel) == basis) for opel in invert_pauli_order(observable)] for observable in diagonal_observables])
+    observables_phases = np.array([1j**obs.phase for obs in diagonal_observables])
+    if np.any(observables_phases.imag != 0):
+        raise ValueError("Diagonal observables must have +-1 phases")
+    observables_phases = observables_phases.real
+    strings_expectation_values = (corrected_samples @ observables_mask.T) % 2
+    strings_expectation_values = (1 - 2*strings_expectation_values) * mask.reshape(-1, 1) * observables_phases
+    strings_expectation_values = strings_expectation_values.reshape((*raw_register.shape[:-1], len(diagonal_observables)))
+    strings_expectation_values = np.sum(strings_expectation_values, axis=-2) / num_shots_kept[..., np.newaxis]
+    strings_expectation_values = np.mean(strings_expectation_values, axis=0) * trex_scale_factors
+    return strings_expectation_values
 
 def many_measure_observables_executor(executor_results, diagonal_observables, basis="Z", confidence=None, register_name="meas"):
     if confidence is not None:
