@@ -27,14 +27,14 @@ def renormalize_observable(measured_observable_arr, p_arr, observable_trace, nqu
                 raise ValueError("expected_observable_arr must be provided if observable_confidence is provided")
             new_confidence = np.zeros_like(observable_confidence)
             try:
-                left_extremum_perr = (observable_confidence[:, 0] - measured_observable_arr) / (observable_trace/2**nqubits - expected_observable_arr)
-                right_extremum_perr = (measured_observable_arr - observable_confidence[:, 1]) / (observable_trace/2**nqubits - expected_observable_arr)
+                left_extremum_perr = (observable_confidence[..., 0] - measured_observable_arr) / (observable_trace/2**nqubits - expected_observable_arr)
+                right_extremum_perr = (measured_observable_arr - observable_confidence[..., 1]) / (observable_trace/2**nqubits - expected_observable_arr)
                 left_obs_deviation = np.abs((measured_observable_arr - p_arr*observable_trace/2**nqubits)/(1 - p_arr)**2 - observable_trace/2**nqubits/(1 - p_arr))*left_extremum_perr
                 right_obs_deviation = np.abs((measured_observable_arr - p_arr*observable_trace/2**nqubits)/(1 - p_arr)**2 - observable_trace/2**nqubits/(1 - p_arr))*right_extremum_perr
             except ValueError:
                 raise ValueError("measured_observable_arr expected_observable_arr must be broadcastable")
-            new_confidence[:, 0] = candidate - left_obs_deviation
-            new_confidence[:, 1] = candidate + right_obs_deviation
+            new_confidence[..., 0] = candidate - left_obs_deviation
+            new_confidence[..., 1] = candidate + right_obs_deviation
         if observable_range is not None:
             mask = np.logical_or(candidate < (1+nantol)*observable_range[0] - nantol, candidate > (1+nantol)*observable_range[1] + nantol)
             candidate[mask] = np.nan
