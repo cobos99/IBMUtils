@@ -142,6 +142,10 @@ class ExecDB:
         jobs = execution.execute_znepea_choosing_layout(backend, job_log_barrier_circuits, parameters_func, db_options, uinst_filter_func, self, optimization_level)
         return jobs
 
+    def execute_znepea(self, backend, job_tbarrier_circuits, parameters_func, db_options, uinst_filter_func=None, optimization_level=3):
+        jobs = execution.execute_znepea(backend, job_tbarrier_circuits, parameters_func, db_options, uinst_filter_func, self, optimization_level)
+        return jobs
+
     # def load_final_samples_from_local_or_ibmq(self, batch_args, ibmq_service, jobs_result_folder, job_index=0, return_data=False, verbose=False):
     #     jobs_data = self.search_by_params(batch_args, "Sampler", ibmq_service=None, limit=job_index+1)
     #     try:
@@ -194,6 +198,19 @@ class ExecDB:
             to_return.append(jobs_data)
         return to_return
 
+    def load_jobs_from_local_or_ibmq(self, batch_args, ibmq_service, job_index=0, return_data=False, verbose=False):
+        jobs_data = self.search_by_params(batch_args, "Sampler", ibmq_service=None, limit=job_index+1)
+        try:
+            jobs_data = jobs_data[job_index]
+        except IndexError:
+            raise ValueError(f"No batch found with the provided parameters")
+        jobs_ids = [job["job_id"] for job in jobs_data["jobs"]]
+        jobs_objs = load_jobs_from_local_or_ibmq(jobs_ids, ibmq_service, verbose=verbose)
+        to_return = [jobs_objs]
+        if return_data:
+            to_return.append(jobs_data)
+        return to_return
+
 def load_job_result(filepath):
     with open(filepath, "r") as f:
         result = json.load(f, cls=RuntimeDecoder)
@@ -231,6 +248,18 @@ def load_results_from_local_or_ibmq(job_ids, ibmq_service, jobs_result_folder=""
                 job_result = None
         job_results.append(job_result)
     return job_results
+
+def load_jobs_from_local_or_ibmq(job_ids, ibmq_service, verbose=False):
+    jobs = []
+    for job_id in job_ids:
+        if verbose: print(f"\rLoading job {job_id}...".ljust(100), end="")
+        job_obj = ibmq_service.job(job_id=job_id)
+        if job_obj.status() == "QUEUED":
+            warnings.warn(f"Job {job_id} is still QUEUED. Waiting for it to complete...", UserWarning, stacklevel=2)
+        if job_obj.status() == "RUNNING":
+            warnings.warn(f"Job {job_id} is still RUNNING. Waiting for it to complete...", UserWarning, stacklevel=2)
+        jobs.append(job_obj)
+    return jobs
 
 def samples_from_result(job_result):
     # if job_result is None:
