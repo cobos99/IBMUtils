@@ -225,18 +225,18 @@ def get_backend_best_qubit_chain(backend, nqubits):
         if qlist["name"] == f"lf_{nqubits:d}":
             return qlist["qubits"]
 
-def transpile_circuits_with_consistent_layout(logical_circuits, backend, layout=None, optimization_level=3):
+def transpile_circuits_with_consistent_layout(logical_circuits, backend, target=None, layout=None, optimization_level=3):
     logical_circuits = numpy_array_of_circuits(logical_circuits)
     ogshape = logical_circuits.shape
     logical_circuits = logical_circuits.flatten().tolist()
-    pm = generate_preset_pass_manager(optimization_level=optimization_level, backend=backend, initial_layout=layout)
+    pm = generate_preset_pass_manager(optimization_level=optimization_level, backend=backend, target=target, initial_layout=layout)
     if layout is None:
         transpiled_circuits = pm.run(logical_circuits[:2])
         if transpiled_circuits[1].layout is not None:
             first_layout = transpiled_circuits[1].layout.final_index_layout()
         else:
             first_layout = None
-        pm = generate_preset_pass_manager(optimization_level=optimization_level, backend=backend, initial_layout=first_layout)
+        pm = generate_preset_pass_manager(optimization_level=optimization_level, backend=backend, target=target, initial_layout=first_layout)
         transpiled_circuits += pm.run(logical_circuits[2:])
     else:
         transpiled_circuits = pm.run(logical_circuits)
