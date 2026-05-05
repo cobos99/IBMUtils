@@ -1,5 +1,6 @@
-from multiprocessing.shared_memory import SharedMemory
+from qiskit_addon_utils.noise_management.post_selection import PostSelector
 from hardware.utils.samples import threadsafe_samples_transfer
+from multiprocessing.shared_memory import SharedMemory
 from qiskit.quantum_info import Pauli, PauliList
 import hardware.utils.measure as measure
 from pymatching import Matching
@@ -72,6 +73,53 @@ def gauge_recovery(samples_dict, postselection_ops, basis="Z", flip_threshold=No
                 break
             
     return recovered_samples_dict
+
+def gauge_recovery_and_measure_executor(executor_result, circuit, backend, postselection_ops, diagonal_observables, trex_scale_factors=None, postselection_strategy="edge", basis="Z", flip_threshold=None, flipped_syndromes=None, minimum_shots=None, register_name="meas"):
+    if flipped_syndromes is not None:
+        if len(flipped_syndromes) != postselection_mask.shape[0]:
+            raise ValueError("flipped syndromes must be the same length as postselection_ops")
+    
+    raw_register = executor_result[register_name]
+    correction_flips = executor_result[f"measurement_flips.{register_name}"]
+
+    # Non-markovian postselection
+    post_selector = PostSelector.from_circuit(circuit, coupling_map=backend.coupling_map)
+    non_markovian_mask = post_selector.compute_mask(executor_result, strategy=postselection_strategy)
+    # num_shots_kept = np.sum(non_markovian_mask, axis=-1)
+    
+    randomization_corrected_samples = (raw_register ^ correction_flips).reshape((-1, raw_register.shape[-1]))
+    postselection_mask = np.array([[int(str(opel) == basis) for opel in operator] for operator in postselection_ops])
+    decoder = Matching(postselection_mask)
+    string_syndromes = (randomization_corrected_samples @ postselection_mask.T) % 2
+    if flipped_syndromes is not None:
+        string_syndromes = (string_syndromes + flipped_syndromes) % 2
+    predicted_flips = decoder.decode_batch(string_syndromes)
+    npredicted_flips = predicted_flips.sum(axis=1).reshape(raw_register.shape[:-1])
+    postselection_recovered_samples = (predicted_flips + randomization_corrected_samples) % 2
+
+    observables_mask = np.array([[int(str(opel) == basis) for opel in measure.invert_pauli_order(observable)] for observable in diagonal_observables])
+    observables_phases = np.array([1j**obs.phase for obs in diagonal_observables])
+    if np.any(observables_phases.imag != 0):
+        raise ValueError("Diagonal observables must have +-1 phases")
+    observables_phases = observables_phases.real
+    strings_expectation_values = (postselection_recovered_samples @ observables_mask.T) % 2
+    strings_expectation_values = (1 - 2*strings_expectation_values) * non_markovian_mask.reshape(-1, 1) * observables_phases
+    strings_expectation_values = strings_expectation_values.reshape(*raw_register.shape[:-1], len(diagonal_observables))
+
+    unique_nflips = np.unique(npredicted_flips)
+    expectation_values = np.zeros((*raw_register.shape[1:-2], raw_register.shape[-1]))
+    num_shots_kept = np.zeros(raw_register.shape[1:-2])
+    for unflips in unique_nflips:
+        if (flip_threshold is not None) and (unflips > flip_threshold):
+            if (minimum_shots is not None) and (num_shots_kept > minimum_shots):
+                break
+        unflips_mask = np.equal(npredicted_flips, unflips)
+        this_nflips_expectations = strings_expectation_values.copy()
+        this_nflips_expectations[~unflips_mask, :] = 0
+        num_shots_kept += np.sum(np.all(~np.equal(this_nflips_expectations, 0), axis=-1), axis=(0, -1))
+        expectation_values += np.sum(this_nflips_expectations, axis=(0, -2))
+    expectation_values = expectation_values / num_shots_kept[:, np.newaxis] #* trex_scale_factors
+    return expectation_values
 
 def get_recovered_samples(samples_dicts, postselection_ops, flip_threshold=None, minimum_shots=None, flipped_syndromes=None, recovery_function=None):
     all_diagonal, basis = measure.diagonal_operators_check(postselection_ops)
