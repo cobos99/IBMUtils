@@ -43,12 +43,12 @@ def diag_obs_postselection_and_odr(job_samples, cal_samples, job_data, postselec
         raise ValueError("The provided observables are not diagonal in the Z basis")
 
     if verbose: print("\rGenerating recovered samples dicts...".ljust(100), end="")
-    recovered_job_samples = ps.get_recovered_samples(job_samples, postselection_ops, 
+    recovered_job_samples = ps.get_recovered_samples(job_samples, postselection_ops,
                                                      flip_threshold=flip_threshold,
                                                      flipped_syndromes=flipped_syndromes,
                                                      minimum_shots=minimum_shots,
                                                      recovery_function=ps.gauge_recovery)
-    recovered_cal_samples = ps.get_recovered_samples(cal_samples, postselection_ops, 
+    recovered_cal_samples = ps.get_recovered_samples(cal_samples, postselection_ops,
                                                      flip_threshold=flip_threshold,
                                                      flipped_syndromes=flipped_syndromes,
                                                      minimum_shots=minimum_shots,
@@ -623,7 +623,7 @@ def peazne(executor_results, job_data, observables_genfuncs, service,
     # TODO: Implement confidence
     # TODO: Properly address failed jobs (compute the expected size in job_db)
     if verbose: print("\rMeasuring diagonal observables...".ljust(100), end="")
-    raw_measured_observables = measure.many_measure_observables_executor(job_results[succesful_jobs_mask], diagonal_observbles_ops)
+    raw_measured_observables = measure.many_measure_observables_executor(job_results[succesful_jobs_mask], diagonal_observbles_ops) 
     raw_measured_observables = np.swapaxes(raw_measured_observables, 0, 1)
     raw_observables = np.full(raw_observables_shape, np.nan)
     raw_observables[:, succesful_jobs_mask, :] = raw_measured_observables
@@ -643,6 +643,347 @@ def peazne(executor_results, job_data, observables_genfuncs, service,
     to_return = [[zne_observables, raw_observables]]
     if return_samples:
         to_return.append(job_results)
+    return to_return if len(to_return) > 1 else to_return[0]
+
+def sum_observables_terms(observables_expectation, observables_coupling, observables_confidence=None):
+    observables_coupling = miscutils.to_padded_array(observables_coupling, fill_value=np.nan, dtype=float)
+    if observables_expectation.shape[::2] != observables_coupling.shape:
+        raise ValueError("observables_expectation and observables_coupling must have the same shape")
+    observables_expectation_times_coupling = observables_expectation * observables_coupling[:, None, :]
+    summed_observables = np.nansum(observables_expectation_times_coupling, axis=2)
+    summed_observables = np.nansum(summed_observables, axis=0)
+    if observables_confidence is not None:
+        left_err = observables_expectation - observables_confidence[:, :, :, 0]
+        right_err = observables_expectation + observables_confidence[:, :, :, 1]
+        left_err_times_coupling = np.abs(left_err * observables_coupling[:, None, :])**2
+        right_err_times_coupling = np.abs(right_err * observables_coupling[:, None, :])**2
+        summed_left_err = np.nansum(left_err_times_coupling, axis=2)
+        summed_left_err = np.sqrt(np.nansum(summed_left_err, axis=0))
+        summed_right_err = np.nansum(right_err_times_coupling, axis=2)
+        summed_right_err = np.sqrt(np.nansum(summed_right_err, axis=0))
+        summed_observables_confidence = np.zeros((*summed_observables.shape, 2), dtype=complex)
+        summed_observables_confidence[:, 0] = summed_observables - summed_left_err*np.exp(1j*np.angle(summed_observables))
+        summed_observables_confidence[:, 1] = summed_observables + summed_right_err*np.exp(1j*np.angle(summed_observables))
+        return summed_observables, summed_observables_confidence
+    return summed_observables
+
+
+_VALID_MITIGATIONS = ("pea", "pea-odr", "pea-odr-trex-ps", "pea-odr-trex-ps-gsc")
+
+
+def postprocessing_joana(executor_jobs, job_data, observables_genfuncs, postselection_genfunc,
+           service,
+           mitigation="pea-odr",
+           flip_threshold=1, flipped_syndromes=None, minimum_shots=300000,
+           zne_func=znemod.perform_linear_zne,
+           zne_noise_factor_indices=None,
+           guess=False,
+           confidence=None,
+           return_samples=False,
+           verbose=False):
+    
+    """Postprocess a PEA experiment: per-noise-factor ODR + ZNE extrapolation.
+
+    Pipeline (per `mitigation`):
+        1. Split the executor results into sim and cal jobs (interleaved, sim is odd
+           indices, cal is even).
+        2. Measure observables — optionally with TREX rescaling, non-Markovian
+           post-selection, and gauge-sector correction.
+        3. ODR depolarizing-rate correction: divide each sim observable by the
+           depolarizing factor inferred from the corresponding cal observable
+           (skipped for ``"pea"`` which has no ODR step).
+        4. ZNE: extrapolate the ODR-corrected sim observables to noise factor 0.
+
+    Parameters
+    ----------
+    executor_jobs : sequence
+        Flat list of jobs interleaved as [cal0, sim0, cal1, sim1, ...].
+    job_data : dict
+        Must contain ``"noise_factors"``, ``"backend"``, ``"noise_learner_job_id"``.
+    observables_genfuncs : callable or list of callables
+        Functions generating the diagonal observables to measure.
+    postselection_genfunc : callable
+        Used by mitigation strategies that include post-selection / gauge recovery.
+    service : QiskitRuntimeService
+        Used to fetch the backend and the noise-learner result.
+    mitigation : str, default "pea-odr"
+        One of ``_VALID_MITIGATIONS`` — controls which TREX / PS / GSC stages run
+        before the ODR + ZNE steps. ``"pea"`` skips the ODR correction entirely.
+    flip_threshold, flipped_syndromes, minimum_shots :
+        Parameters forwarded to gauge-recovery post-selection.
+    zne_func : callable, default ``znemod.perform_linear_zne``
+        Extrapolation function with signature ``(noise_rates, measurements) -> ZNEResult``.
+        Any of the ``perform_*_zne`` functions in :mod:`hardware.utils.zne` works.
+    zne_noise_factor_indices : sequence of int, optional
+        Subset of noise-factor indices to use in the extrapolation (must include
+        at least 2). Defaults to all of them.
+    guess : bool, default False
+        If True, use the cal observables to constrain the ZNE fit:
+
+            (a) fit each cal-observable curve in the same family as ``zne_func``
+                with the intercept pinned to 1 (the known ideal cal value at
+                noise factor 0), to obtain the noise-shape parameters;
+            (b) refit each sim-observable curve in that same family but with the
+                shape parameters fixed to the cal values, freeing only the
+                intercept term.
+
+        The resulting cal-guided intercepts replace ``zne_observables``. Useful
+        when the cal curve is cleaner than the sim curve and the shape of the
+        noise vs. noise-factor dependence is shared between sim and cal.
+    confidence : not implemented yet — must be None.
+    return_samples : bool, default False
+        If True, also return the raw sim ``PrimitiveResult`` objects.
+    verbose : bool, default False
+        Print progress sections / per-step diagnostics.
+
+    Returns
+    -------
+    list
+        ``[[zne_observables, clean_observables]]`` and, if ``return_samples``,
+        ``sim_results`` appended. ``zne_observables`` has shape
+        ``(n_circuits_per_nf, n_observables_genfuncs)``; ``clean_observables``
+        adds a leading noise-factor axis.
+    """
+
+    if confidence is not None:
+        raise NotImplementedError("Confidence intervals are not yet implemented for peaodr")
+
+    if mitigation not in _VALID_MITIGATIONS:
+        raise ValueError(f"mitigation must be one of {_VALID_MITIGATIONS}, got {mitigation!r}")
+
+    # Local printing helpers, scoped to this function
+    def _say(msg):
+        if verbose:
+            print(f"› {msg}")
+
+    def _section(title):
+        if verbose:
+            bar = "─" * (len(title) + 4)
+            print(f"\n{bar}\n  {title}\n{bar}")
+
+    try:
+        noise_factors = np.array(job_data["noise_factors"])
+    except KeyError:
+        raise WorkflowError("job_data must contain the 'noise_factors' key")
+
+    if not isinstance(observables_genfuncs, (tuple, list)):
+        observables_genfuncs = [observables_genfuncs]
+    raw_observables_shape = (len(noise_factors), int(len(executor_jobs))//2, len(observables_genfuncs))
+
+    nf_labels = list(noise_factors)
+
+    _section(f"postprocessing · mitigation = {mitigation}")
+
+    # Separate sim and cal results
+    sim_jobs = np.array(executor_jobs, dtype=object).flatten()[1::2]
+    cal_jobs = np.array(executor_jobs, dtype=object).flatten()[::2]
+    sim_results = np.array([job.result()[0] for job in sim_jobs], dtype=object).flatten()
+    cal_results = np.array([job.result()[0] for job in cal_jobs], dtype=object).flatten()
+    succesful_sim_mask = np.array([len(res.keys()) > 0 for res in sim_results])
+    succesful_cal_mask = np.array([len(res.keys()) > 0 for res in cal_results])
+    _say(f"Loaded {len(sim_jobs)} sim jobs, {len(cal_jobs)} cal jobs "
+         f"({succesful_sim_mask.sum()} sim / {succesful_cal_mask.sum()} cal successful)")
+
+    # Get observables and nqubits
+    nqubits = list(sim_results[0].values())[0].shape[-1]
+    diagonal_observables_ops, non_diagonal_observables_ops = measure.generate_observables(nqubits, observables_genfuncs)
+    if non_diagonal_observables_ops:
+        raise ValueError("The provided observables are not diagonal in the Z basis")
+
+    # Load noise learner result
+    _say("Loading noise learner result")
+    nl_data = service.job(job_data["noise_learner_job_id"]).result()
+    if verbose:
+        nl_min_kept = min([min(d.values()) for d in [nlr.metadata['post_selection']['fraction_kept'] for nlr in nl_data[:2]]])
+        _say(f"Minimum fraction of shots kept in noise learning experiments: {nl_min_kept:.2f}")
+
+    # ----- Mitigation dispatch -----
+    if mitigation == 'pea-odr-trex-ps-gsc':
+        # Gauge sector correction + TREX + non-Markovian PS
+        trex_noise_model = nl_data[-1].to_pauli_lindblad_map()
+        rescale_factors = trex.get_scale_factors(trex_noise_model, diagonal_observables_ops)
+        backend = service.backend(job_data["backend"])
+        postselection_operators, diagonal_observables_ops, non_diagonal_observables_ops, basis = ps.initialize_postselection(nqubits, postselection_genfunc, observables_genfuncs)
+
+        _section("SIM · GSC + TREX + non-Markovian PS")
+        raw_sim_measured_observables = []
+        for i, (sim_result, sim_job) in enumerate(zip(sim_results, sim_jobs)):
+            circuit = executorutils.load_circuit_from_job(sim_job)
+            raw_sim_measured_observables.append(
+                ps.gauge_recovery_and_measure_executor(
+                    sim_result, circuit, backend, postselection_operators, diagonal_observables_ops,
+                    trex_scale_factors=rescale_factors, postselection_strategy="edge", basis="Z",
+                    flip_threshold=flip_threshold, flipped_syndromes=flipped_syndromes,
+                    minimum_shots=minimum_shots, register_name="meas",
+                    verbose=verbose, label=f"sim · job {i}", noise_factor_labels=nf_labels,
+                )
+            )
+        raw_sim_measured_observables = np.swapaxes(np.array(raw_sim_measured_observables), 0, 1)
+
+        _section("CAL · GSC + TREX + non-Markovian PS")
+        raw_cal_measured_observables = []
+        for i, (cal_result, cal_job) in enumerate(zip(cal_results, cal_jobs)):
+            circuit = executorutils.load_circuit_from_job(cal_job)
+            raw_cal_measured_observables.append(
+                ps.gauge_recovery_and_measure_executor(
+                    cal_result, circuit, backend, postselection_operators, diagonal_observables_ops,
+                    trex_scale_factors=rescale_factors, postselection_strategy="edge", basis="Z",
+                    flip_threshold=flip_threshold, flipped_syndromes=flipped_syndromes,
+                    minimum_shots=minimum_shots, register_name="meas",
+                    verbose=verbose, label=f"cal · job {i}", noise_factor_labels=nf_labels,
+                )
+            )
+        raw_cal_measured_observables = np.swapaxes(np.array(raw_cal_measured_observables), 0, 1)
+
+        _section("ODR depolarizing-rate correction")
+        clean_observables = np.full(raw_sim_measured_observables.shape, np.nan)
+        for i in range(len(noise_factors)):
+            raw_cal_measured_observables_nf = np.abs(raw_cal_measured_observables[i])
+            raw_sim_measured_observables_nf = raw_sim_measured_observables[i]
+            p_arr = odr.compute_depolarizing_probability(raw_cal_measured_observables_nf, 1, 0, nqubits)
+            clean_observables_nf = odr.renormalize_observable(raw_sim_measured_observables_nf, p_arr, 0, nqubits, expected_observable_arr=1)
+            clean_observables[i] = clean_observables_nf
+        _say(f"Applied ODR correction over {len(noise_factors)} noise factors")
+        clean_cal_observables = raw_cal_measured_observables.copy()
+        
+    if mitigation == "pea-odr-trex-ps":
+        # TREX + non-Markovian post-selection
+        trex_noise_model = nl_data[-1].to_pauli_lindblad_map()
+        rescale_factors = trex.get_scale_factors(trex_noise_model, diagonal_observables_ops)
+        backend = service.backend(job_data["backend"])
+
+        _section("SIM · TREX + non-Markovian PS")
+        sim_jobs_circuits = [executorutils.load_circuit_from_job(job) for job in sim_jobs]
+        raw_sim_measured_observables = []
+        for i in range(len(sim_jobs_circuits)):
+            if not succesful_sim_mask[i]:
+                raw_sim_measured_observables.append(np.full((len(diagonal_observables_ops),), np.nan))
+                continue
+            this_obs = measure.measure_observables_postselection(
+                sim_results[i], sim_jobs_circuits[i], backend, diagonal_observables_ops,
+                trex_scale_factors=rescale_factors,
+                verbose=verbose, label=f"sim · job {i}", noise_factor_labels=nf_labels,
+            )
+            raw_sim_measured_observables.append(this_obs)
+        raw_sim_measured_observables = np.swapaxes(np.array(raw_sim_measured_observables), 0, 1)
+
+        _section("CAL · TREX + non-Markovian PS")
+        cal_jobs_circuits = [executorutils.load_circuit_from_job(job) for job in cal_jobs]
+        raw_cal_measured_observables = []
+        for i in range(len(cal_jobs_circuits)):
+            if not succesful_cal_mask[i]:
+                raw_cal_measured_observables.append(np.full((len(diagonal_observables_ops),), np.nan))
+                continue
+            this_obs = measure.measure_observables_postselection(
+                cal_results[i], cal_jobs_circuits[i], backend, diagonal_observables_ops,
+                trex_scale_factors=rescale_factors,
+                verbose=verbose, label=f"cal · job {i}", noise_factor_labels=nf_labels,
+            )
+            raw_cal_measured_observables.append(this_obs)
+        raw_cal_measured_observables = np.swapaxes(np.array(raw_cal_measured_observables), 0, 1)
+
+        _section("ODR depolarizing-rate correction")
+        clean_observables = np.full(raw_sim_measured_observables.shape, np.nan)
+        for i in range(len(noise_factors)):
+            raw_cal_measured_observables_nf = np.abs(raw_cal_measured_observables[i])
+            raw_sim_measured_observables_nf = raw_sim_measured_observables[i]
+            p_arr = odr.compute_depolarizing_probability(raw_cal_measured_observables_nf, 1, 0, nqubits)
+            clean_observables_nf = odr.renormalize_observable(raw_sim_measured_observables_nf, p_arr, 0, nqubits, expected_observable_arr=1)
+            clean_observables[i] = clean_observables_nf
+        _say(f"Applied ODR correction over {len(noise_factors)} noise factors")
+        clean_cal_observables = raw_cal_measured_observables.copy()
+
+    if mitigation == 'pea-odr':
+        # Plain measurement (no TREX, no PS, no GSC) -- "pea" or "pea-odr"
+        _section("SIM/CAL · plain measurement")
+        _say("Measuring sim and cal observables")
+        raw_sim_measured_observables = measure.many_measure_observables_executor(sim_results[succesful_sim_mask], diagonal_observables_ops)
+        raw_sim_measured_observables = np.swapaxes(raw_sim_measured_observables, 0, 1)
+
+        raw_cal_measured_observables = measure.many_measure_observables_executor(cal_results[succesful_cal_mask], diagonal_observables_ops)
+        raw_cal_measured_observables = np.swapaxes(raw_cal_measured_observables, 0, 1)
+
+        _section("ODR depolarizing-rate correction")
+        clean_observables = np.full(raw_sim_measured_observables.shape, np.nan)
+        for i in range(len(noise_factors)):
+            raw_cal_measured_observables_nf = np.abs(raw_cal_measured_observables[i])
+            raw_sim_measured_observables_nf = raw_sim_measured_observables[i]
+            p_arr = odr.compute_depolarizing_probability(raw_cal_measured_observables_nf, 1, 0, nqubits)
+            clean_observables_nf = odr.renormalize_observable(raw_sim_measured_observables_nf, p_arr, 0, nqubits, expected_observable_arr=1)
+            clean_observables[i] = clean_observables_nf
+        _say(f"Applied ODR correction over {len(noise_factors)} noise factors")
+        clean_cal_observables = raw_cal_measured_observables.copy()
+
+    if mitigation == 'pea':
+
+        # Plain measurement (no TREX, no PS, no GSC) -- "pea" or "pea-odr"
+        _section("SIM/CAL · plain measurement")
+        _say("Measuring sim and cal observables")
+        raw_sim_measured_observables = measure.many_measure_observables_executor(sim_results[succesful_sim_mask], diagonal_observables_ops)
+        raw_sim_measured_observables = np.swapaxes(raw_sim_measured_observables, 0, 1)
+
+        raw_cal_measured_observables = measure.many_measure_observables_executor(cal_results[succesful_cal_mask], diagonal_observables_ops)
+        raw_cal_measured_observables = np.swapaxes(raw_cal_measured_observables, 0, 1)
+
+        clean_observables = raw_sim_measured_observables.copy()
+        clean_cal_observables = raw_cal_measured_observables.copy()
+
+    # ----- ZNE extrapolation -----
+    _section("ZNE extrapolation")
+    if zne_noise_factor_indices is None:
+        zne_indices = np.arange(len(noise_factors))
+    else:
+        zne_indices = np.array(list(zne_noise_factor_indices), dtype=int)
+        if zne_indices.size < 2:
+            raise ValueError("zne_noise_factor_indices must select at least 2 noise factors for extrapolation")
+        if zne_indices.min() < 0 or zne_indices.max() >= len(noise_factors):
+            raise ValueError(f"zne_noise_factor_indices out of range for {len(noise_factors)} noise factors")
+    selected_noise_factors = noise_factors[zne_indices]
+    dropped = [nf.item() for i, nf in enumerate(noise_factors) if i not in set(zne_indices.tolist())]
+    selected_for_print = [nf.item() for nf in selected_noise_factors]
+    if dropped:
+        _say(f"Extrapolating using noise factors {selected_for_print} (dropped: {dropped})")
+    else:
+        _say(f"Extrapolating using all noise factors {selected_for_print}")
+    zne_observables = np.full(raw_observables_shape[1::], np.nan)
+    for inds in np.ndindex(clean_observables.shape[1::]):
+        observables_for_reg = list(clean_observables[zne_indices, *inds])
+        if np.isnan(observables_for_reg).any():
+            zne_observables[inds] = np.nan
+        else:
+            zne_results = zne_func(selected_noise_factors, observables_for_reg)
+            zne_observables[inds] = zne_results.intercept
+
+    if guess:
+        _say("Guess mode: fitting cal observables with intercept fixed at 1, "
+             "then refitting sim with shape parameters fixed")
+        cal_fitter, sim_applier = znemod._identify_zne_family(zne_func)
+        guessed_zne_observables = np.full(raw_observables_shape[1::], np.nan)
+        n_failed_cal = 0
+        n_failed_sim = 0
+        for inds in np.ndindex(clean_observables.shape[1::]):
+            cal_for_reg = np.array(clean_cal_observables[zne_indices, *inds], dtype=float)
+            sim_for_reg = np.array(clean_observables[zne_indices, *inds], dtype=float)
+            if np.isnan(cal_for_reg).any() or np.isnan(sim_for_reg).any():
+                continue
+            cal_params = cal_fitter(selected_noise_factors, np.abs(cal_for_reg))
+            if any(not np.all(np.isfinite(np.atleast_1d(v))) for v in cal_params.values()):
+                n_failed_cal += 1
+                continue
+            sim_result = sim_applier(selected_noise_factors, sim_for_reg, cal_params)
+            if not np.isfinite(sim_result.intercept):
+                n_failed_sim += 1
+                continue
+            guessed_zne_observables[inds] = sim_result.intercept
+        if n_failed_cal or n_failed_sim:
+            _say(f"Guess mode: {n_failed_cal} cal fits failed, {n_failed_sim} sim refits failed")
+        zne_observables = guessed_zne_observables
+
+    _say(f"Done · processed {len(sim_results.flatten())} sim results")
+    to_return = [[zne_observables, clean_observables, clean_cal_observables]]
+    if return_samples:
+        to_return.append(sim_results)
+
     return to_return if len(to_return) > 1 else to_return[0]
 
 def sum_observables_terms(observables_expectation, observables_coupling, observables_confidence=None):

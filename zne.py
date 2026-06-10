@@ -362,6 +362,248 @@ def perform_exponential_zne(noise_rates, measurements, p0=None):
     except RuntimeError:
         return ZNEResult(np.nan, np.nan, None, None, np.nan)
 
+def perform_polynomial_zne(noise_rates, measurements, degree=2):
+    """Polynomial ZNE: fit y = sum_k c_k x^k of given `degree`, extrapolate to x=0.
+
+    Returns a ZNEResult where:
+      - intercept : extrapolated value at noise_rate = 0
+      - std_err   : standard error on that intercept (0 if exactly determined)
+      - slope     : leading-order coefficient (c_1) — the linear sensitivity at 0
+      - r_value   : R of the fit (sqrt of R²)
+      - p_value   : None
+    """
+    noise_rates = np.array(noise_rates).flatten()
+    measurements = np.array(measurements).flatten()
+    if noise_rates.shape != measurements.shape:
+        raise ValueError("Noise rates and measurements must have the same shape.")
+    n = len(noise_rates)
+    if n < degree + 1:
+        return ZNEResult(np.nan, np.nan, None, None, np.nan)
+    try:
+        if n > degree + 1:
+            coeffs, cov = np.polyfit(noise_rates, measurements, deg=degree, cov=True)
+            intercept_var = float(cov[-1, -1])
+        else:
+            coeffs = np.polyfit(noise_rates, measurements, deg=degree)
+            intercept_var = 0.0
+        poly = np.poly1d(coeffs)
+        intercept = float(poly(0.0))
+        std_err = float(np.sqrt(max(intercept_var, 0.0)))
+        # leading-order term c_1 (coefficient of x^1)
+        slope = float(coeffs[-2]) if degree >= 1 else 0.0
+        ss_res = float(np.sum((measurements - poly(noise_rates))**2))
+        ss_tot = float(np.sum((measurements - measurements.mean())**2))
+        r_value = float(np.sqrt(max(1.0 - ss_res/ss_tot, 0.0))) if ss_tot > 0 else None
+        return ZNEResult(slope, intercept, r_value, None, std_err)
+    except (np.linalg.LinAlgError, ValueError):
+        return ZNEResult(np.nan, np.nan, None, None, np.nan)
+
+def perform_quadratic_zne(noise_rates, measurements):
+    """Convenience wrapper: degree-2 polynomial ZNE."""
+    return perform_polynomial_zne(noise_rates, measurements, degree=2)
+
+def perform_cubic_zne(noise_rates, measurements):
+    """Convenience wrapper: degree-3 polynomial ZNE.
+
+    Note: with only 4 noise factors this is exactly determined (interpolating)
+    and std_err will be 0. Use only when you have >= 5 noise factors.
+    """
+    return perform_polynomial_zne(noise_rates, measurements, degree=3)
+
+def fit_cal_linear(noise_rates, cal_measurements):
+    """Linear cal fit y = 1 + s*x with intercept pinned to 1. Returns dict with shape params."""
+    x = np.array(noise_rates).flatten()
+    y = np.array(cal_measurements).flatten()
+    if x.shape != y.shape or len(x) < 1:
+        return {"slope": np.nan}
+    denom = float(np.sum(x*x))
+    slope = float(np.sum(x*(y - 1.0)) / denom) if denom > 0 else np.nan
+    return {"slope": slope}
+
+def fit_cal_polynomial(noise_rates, cal_measurements, degree=2):
+    """Polynomial cal fit y = 1 + sum_{k>=1} c_k x^k with intercept pinned to 1.
+    Returns dict with the higher-order coeffs (constant term is fixed)."""
+    x = np.array(noise_rates).flatten()
+    y = np.array(cal_measurements).flatten()
+    if x.shape != y.shape or len(x) < degree:
+        return {"coeffs_high": np.full(degree, np.nan)}
+    # Design matrix [x, x^2, ..., x^degree], regressing (y-1)
+    X = np.vstack([x**k for k in range(1, degree+1)]).T
+    coeffs, *_ = np.linalg.lstsq(X, y - 1.0, rcond=None)
+    return {"coeffs_high": coeffs}  # order: c_1, c_2, ..., c_degree
+
+def fit_cal_exponential(noise_rates, cal_measurements):
+    """Cal fit y = exp(-b*x), intercept pinned to 1. Returns dict with shape param b."""
+    x = np.array(noise_rates).flatten()
+    y = np.array(cal_measurements).flatten()
+    if x.shape != y.shape or len(x) < 1:
+        return {"b": np.nan}
+    def exp_func(xv, b):
+        return np.exp(-b*xv)
+    try:
+        popt, _ = curve_fit(exp_func, x, y, p0=[0.3], maxfev=10000)
+        return {"b": float(popt[0])}
+    except (RuntimeError, ValueError):
+        return {"b": np.nan}
+
+def fit_cal_exponential_offset(noise_rates, cal_measurements):
+    """Cal fit y = a*exp(-b*x) + c with constraint a + c = 1. Returns shape params (a, b)."""
+    x = np.array(noise_rates).flatten()
+    y = np.array(cal_measurements).flatten()
+    if x.shape != y.shape or len(x) < 2:
+        return {"a": np.nan, "b": np.nan}
+    # With a + c = 1 ⇒ c = 1 - a; model: y = a*exp(-b*x) + (1 - a) = 1 + a*(exp(-b*x) - 1)
+    def model(xv, a, b):
+        return 1.0 + a*(np.exp(-b*xv) - 1.0)
+    try:
+        popt, _ = curve_fit(model, x, y, p0=[1.0, 0.3], maxfev=10000)
+        return {"a": float(popt[0]), "b": float(popt[1])}
+    except (RuntimeError, ValueError):
+        return {"a": np.nan, "b": np.nan}
+
+
+def apply_linear_with_slope(noise_rates, sim_measurements, cal_params):
+    """Sim ZNE with the linear slope from the cal fit fixed.
+    Refits y = a + slope*x for the intercept a only. Returns ZNEResult."""
+    x = np.array(noise_rates).flatten()
+    y = np.array(sim_measurements).flatten()
+    s = cal_params.get("slope", np.nan)
+    if not np.isfinite(s) or x.shape != y.shape or len(x) < 1:
+        return ZNEResult(np.nan, np.nan, None, None, np.nan)
+    residual = y - s*x
+    intercept = float(np.mean(residual))
+    n = len(x)
+    if n > 1:
+        std_err = float(np.std(residual, ddof=1) / np.sqrt(n))
+    else:
+        std_err = 0.0
+    return ZNEResult(float(s), intercept, None, None, std_err)
+
+def apply_polynomial_with_coeffs(noise_rates, sim_measurements, cal_params):
+    """Sim ZNE with all higher-order polynomial coeffs fixed from cal.
+    Refits only the constant term: y = a + sum_{k>=1} c_k x^k. Returns ZNEResult."""
+    x = np.array(noise_rates).flatten()
+    y = np.array(sim_measurements).flatten()
+    c_high = np.asarray(cal_params.get("coeffs_high", []), dtype=float)
+    if c_high.size == 0 or np.any(~np.isfinite(c_high)) or x.shape != y.shape:
+        return ZNEResult(np.nan, np.nan, None, None, np.nan)
+    poly_high = sum(c_high[k-1] * x**k for k in range(1, len(c_high)+1))
+    residual = y - poly_high
+    intercept = float(np.mean(residual))
+    n = len(x)
+    if n > 1:
+        std_err = float(np.std(residual, ddof=1) / np.sqrt(n))
+    else:
+        std_err = 0.0
+    slope = float(c_high[0]) if len(c_high) >= 1 else 0.0
+    return ZNEResult(slope, intercept, None, None, std_err)
+
+def apply_exponential_with_rate(noise_rates, sim_measurements, cal_params):
+    """Sim ZNE y = a*exp(-b*x) with b fixed from cal; fit a. Returns ZNEResult."""
+    x = np.array(noise_rates).flatten()
+    y = np.array(sim_measurements).flatten()
+    b = cal_params.get("b", np.nan)
+    if not np.isfinite(b) or x.shape != y.shape or len(x) < 1:
+        return ZNEResult(np.nan, np.nan, None, None, np.nan)
+    basis = np.exp(-b*x)
+    denom = float(np.sum(basis*basis))
+    if denom <= 0:
+        return ZNEResult(np.nan, np.nan, None, None, np.nan)
+    a = float(np.sum(basis*y) / denom)
+    residual = y - a*basis
+    n = len(x)
+    if n > 1:
+        std_err = float(np.std(residual, ddof=1) / np.sqrt(n))
+    else:
+        std_err = 0.0
+    return ZNEResult(float(-a*b), a, None, None, std_err)
+
+def apply_exponential_offset_with_params(noise_rates, sim_measurements, cal_params):
+    """Sim ZNE y = a*exp(-b*x) + c with b fixed from cal; fit (a, c). intercept = a+c."""
+    x = np.array(noise_rates).flatten()
+    y = np.array(sim_measurements).flatten()
+    b = cal_params.get("b", np.nan)
+    if not np.isfinite(b) or x.shape != y.shape or len(x) < 2:
+        return ZNEResult(np.nan, np.nan, None, None, np.nan)
+    basis = np.exp(-b*x)
+    X = np.vstack([basis, np.ones_like(x)]).T
+    try:
+        coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+        a, c = float(coef[0]), float(coef[1])
+    except np.linalg.LinAlgError:
+        return ZNEResult(np.nan, np.nan, None, None, np.nan)
+    intercept = a + c
+    residual = y - (a*basis + c)
+    n = len(x)
+    if n > 2:
+        std_err = float(np.std(residual, ddof=1) / np.sqrt(n))
+    else:
+        std_err = 0.0
+    return ZNEResult(float(-a*b), intercept, None, None, std_err)
+
+
+# Registry mapping a `zne_func` to its (cal_fitter, sim_applier) pair for guess-mode.
+# Used by postprocessing_joana when guess=True.
+def _identify_zne_family(zne_func):
+    """Return (cal_fitter, sim_applier) for the family of `zne_func`."""
+    name = getattr(zne_func, "__name__", "")
+    if name == "perform_linear_zne":
+        return fit_cal_linear, apply_linear_with_slope
+    if name == "perform_quadratic_zne":
+        return (lambda nr, y: fit_cal_polynomial(nr, y, degree=2)), apply_polynomial_with_coeffs
+    if name == "perform_cubic_zne":
+        return (lambda nr, y: fit_cal_polynomial(nr, y, degree=3)), apply_polynomial_with_coeffs
+    if name == "perform_polynomial_zne":
+        return fit_cal_polynomial, apply_polynomial_with_coeffs
+    if name == "perform_exponential_zne":
+        return fit_cal_exponential, apply_exponential_with_rate
+    if name == "perform_exponential_offset_zne":
+        return fit_cal_exponential_offset, apply_exponential_offset_with_params
+    raise ValueError(f"guess mode does not know the family of zne_func={name!r}; "
+                     f"supported: perform_linear_zne, perform_quadratic_zne, "
+                     f"perform_cubic_zne, perform_exponential_zne, perform_exponential_offset_zne")
+
+
+def perform_exponential_offset_zne(noise_rates, measurements, p0=None):
+    """Exponential ZNE with a free offset: y = a*exp(-b*x) + c, extrapolated to x=0.
+
+    Same signature/return as perform_linear_zne / perform_exponential_zne so it's
+    a drop-in `zne_func=` for the postprocessing pipeline.
+      - intercept : a + c (value at x=0)
+      - std_err   : propagated SE on (a+c) using the fit covariance
+      - slope     : -a*b (derivative at x=0)
+    """
+    noise_rates = np.array(noise_rates).flatten()
+    measurements = np.array(measurements).flatten()
+    if noise_rates.shape != measurements.shape:
+        raise ValueError("Noise rates and measurements must have the same shape.")
+    if len(noise_rates) < 3:
+        return ZNEResult(np.nan, np.nan, None, None, np.nan)
+
+    def exp_func(x, a, b, c):
+        return a*np.exp(-b*x) + c
+
+    if p0 is None:
+        c0 = float(np.min(measurements) if measurements[-1] < measurements[0] else np.max(measurements))
+        a0 = float(measurements[0] - c0) if measurements[0] != c0 else 1.0
+        p0 = [a0, 0.3, c0]
+
+    try:
+        popt, pcov = curve_fit(exp_func, noise_rates, measurements, p0=p0, maxfev=10000)
+        a, b, c = popt
+        intercept = float(a + c)
+        # Var(a + c) = Var(a) + Var(c) + 2*Cov(a, c)
+        var_intercept = float(pcov[0, 0] + pcov[2, 2] + 2*pcov[0, 2])
+        std_err = float(np.sqrt(max(var_intercept, 0.0)))
+        slope = float(-a*b)
+        y_hat = exp_func(noise_rates, *popt)
+        ss_res = float(np.sum((measurements - y_hat)**2))
+        ss_tot = float(np.sum((measurements - measurements.mean())**2))
+        r_value = float(np.sqrt(max(1.0 - ss_res/ss_tot, 0.0))) if ss_tot > 0 else None
+        return ZNEResult(slope, intercept, r_value, None, std_err)
+    except (RuntimeError, ValueError):
+        return ZNEResult(np.nan, np.nan, None, None, np.nan)
+
 def plot_layoutzne_extrapolation(all_cycles_observables, zne_layouts, noise_rates, color=None):
     zne_layouts = np.array(zne_layouts)
     noise_rates = np.array(noise_rates)

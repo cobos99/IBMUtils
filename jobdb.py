@@ -1,8 +1,8 @@
 from qiskit_ibm_runtime.exceptions import RuntimeJobFailureError, RuntimeInvalidStateError
-from qiskit_ibm_runtime.quantum_program.quantum_program_result import QuantumProgramResult
+from qiskit_ibm_runtime.results.quantum_program import QuantumProgramResult
 from qiskit_ibm_runtime import RuntimeDecoder, RuntimeEncoder
-from utils.samples import group_multirep_samples_dicts
-import utils.execution as execution
+from hardware.utils.samples import group_multirep_samples_dicts
+import hardware.utils.execution as execution
 import numpy as np
 import warnings
 import json
@@ -140,6 +140,14 @@ class ExecDB:
 
     def execute_znepea_choosing_layout(self, backend, job_log_barrier_circuits, parameters_func, db_options, uinst_filter_func=None, optimization_level=3):
         jobs = execution.execute_znepea_choosing_layout(backend, job_log_barrier_circuits, parameters_func, db_options, uinst_filter_func, self, optimization_level)
+        return jobs
+
+    def execute_znepeaodr_choosing_layout(self, backend, job_log_barrier_circuits, parameters_func, db_options, uinst_filter_func=None, optimization_level=3):
+        jobs = execution.execute_znepeaodr_choosing_layout(backend, job_log_barrier_circuits, parameters_func, db_options, uinst_filter_func, self, optimization_level)
+        return jobs
+
+    def execute_new_peaodr(self, backend, job_tbarrier_circuits, parameters_func, db_options, uinst_filter_func=None, optimization_level=3):
+        jobs = execution.execute_new_peaodr(backend, job_tbarrier_circuits, parameters_func, db_options, uinst_filter_func, self, optimization_level)
         return jobs
 
     def execute_znepea(self, backend, job_tbarrier_circuits, parameters_func, db_options, uinst_filter_func=None, optimization_level=3):

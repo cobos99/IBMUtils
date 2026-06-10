@@ -232,16 +232,42 @@ def measure_observables_executor(executor_result, diagonal_observables, basis="Z
     expectation_values = np.mean(strings_expectation_values, axis=(0, -2))
     return expectation_values
 
-def measure_observables_postselection(executor_result, circuit, backend, diagonal_observables, trex_scale_factors=None, postselection_strategy="edge", basis="Z", register_name="meas"):
+def print_postselection_retention(mask, label=None, noise_factor_labels=None, header_suffix="post-selection retention"):
+    # Aggregate kept/total per noise factor, assuming axis 1 of mask is the noise-factor axis.
+    kept_per_nf = np.sum(mask, axis=tuple(i for i in range(mask.ndim) if i != 1))
+    total_per_nf = int(np.prod([mask.shape[i] for i in range(mask.ndim) if i != 1]))
+    n_nf = mask.shape[1]
+    if noise_factor_labels is None:
+        nf_labels = [f"nf[{i}]" for i in range(n_nf)]
+    else:
+        nf_labels = [f"λ={l}" for l in noise_factor_labels]
+    label_w = max(len(s) for s in nf_labels)
+    count_w = len(f"{total_per_nf:,}")
+    header = f"[{label}] {header_suffix}:" if label else f"{header_suffix.capitalize()}:"
+    lines = [header]
+    for lab, kept in zip(nf_labels, kept_per_nf):
+        pct = 100 * kept / total_per_nf
+        lines.append(f"    {lab:<{label_w}}  {pct:5.1f}%   ({kept:>{count_w},} / {total_per_nf:,})")
+    print("\n".join(lines))
+
+
+def measure_observables_postselection(executor_result, circuit, backend, diagonal_observables, trex_scale_factors=None, postselection_strategy="edge", basis="Z", register_name="meas", verbose=True, label=None, noise_factor_labels=None):
+
     if isinstance(diagonal_observables, Pauli):
         diagonal_observables = [diagonal_observables]
+
     post_selector = PostSelector.from_circuit(circuit, coupling_map=backend.coupling_map)
     mask = post_selector.compute_mask(executor_result, strategy=postselection_strategy)
+
     num_shots_kept = np.sum(mask, axis=-1)
+
+    if verbose:
+        print_postselection_retention(mask, label=label, noise_factor_labels=noise_factor_labels,
+                                       header_suffix="non-Markovian post-selection retention")
+
     if trex_scale_factors is None:
         trex_scale_factors = np.ones(len(diagonal_observables))
-    if isinstance(diagonal_observables, Pauli):
-        diagonal_observables = [diagonal_observables]
+
     raw_register = executor_result[register_name]
     correction_flips = executor_result[f"measurement_flips.{register_name}"]
     corrected_samples = (raw_register ^ correction_flips).reshape((-1, raw_register.shape[-1]))
@@ -249,14 +275,26 @@ def measure_observables_postselection(executor_result, circuit, backend, diagona
 
     observables_mask = np.array([[int(str(opel) == basis) for opel in invert_pauli_order(observable)] for observable in diagonal_observables])
     observables_phases = np.array([1j**obs.phase for obs in diagonal_observables])
+
     if np.any(observables_phases.imag != 0):
         raise ValueError("Diagonal observables must have +-1 phases")
     observables_phases = observables_phases.real
     strings_expectation_values = (corrected_samples @ observables_mask.T) % 2
     strings_expectation_values = (1 - 2*strings_expectation_values) * mask.reshape(-1, 1) * observables_phases
     strings_expectation_values = strings_expectation_values.reshape((*raw_register.shape[:-1], len(diagonal_observables)))
-    strings_expectation_values = np.sum(strings_expectation_values, axis=-2) / num_shots_kept[..., np.newaxis]
-    strings_expectation_values = np.mean(strings_expectation_values, axis=0) * trex_scale_factors
+
+    # Per-randomization, per-noise-factor mean over surviving shots, NaN-safe for zero-kept twirls
+    safe_num_kept = np.where(num_shots_kept > 0, num_shots_kept, 1)
+    strings_expectation_values = np.sum(strings_expectation_values, axis=-2) / safe_num_kept[..., np.newaxis]
+    strings_expectation_values = np.where(num_shots_kept[..., np.newaxis] > 0, strings_expectation_values, np.nan)
+
+    # Weight each randomization by its kept-shot fraction (independently per noise factor),
+    # so randomizations with more surviving shots dominate. Zero-kept twirls contribute zero weight.
+    weights = num_shots_kept / np.sum(num_shots_kept, axis=0, keepdims=True)
+    strings_expectation_values = np.nansum(
+        strings_expectation_values * weights[..., np.newaxis], axis=0
+    ) * trex_scale_factors
+    
     return strings_expectation_values
 
 def many_measure_observables_executor(executor_results, diagonal_observables, basis="Z", confidence=None, register_name="meas"):

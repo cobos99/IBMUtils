@@ -1332,10 +1332,13 @@ def characterize_backend(
         _emit(
             f"Layered two-qubit RB submitted: job_ids = {merged_ids if merged_ids else 'None'}"
         )
+
     if "coherence" in chosen:
         _updated_t1_t2_dict = _update_coherence_errors(
             backend=backend, sampler=sampler, shots=shots
         )
+    else:
+        _updated_t1_t2_dict = None
 
     # ---- Build error maps ----
     ro_error_map: Optional[Dict[int, float]] = None

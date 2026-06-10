@@ -2,7 +2,7 @@ from qiskit_addon_utils.noise_management.post_selection.transpiler.passes import
 from qiskit_ibm_runtime import Batch, Session, SamplerV2, Executor, NoiseLearnerV3, NoiseLearnerV3Options, QuantumProgram
 from hardware.utils.circs import numpy_array_of_circuits, check_and_measure_active_qubits
 from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
-import hardware.utils.characterization as characterization
+import hardware.utils.utils_characterization as characterization
 import hardware.utils.benchmarks as benchmarks
 from qiskit.transpiler import PassManager
 import hardware.utils.circs as circutils
@@ -364,7 +364,8 @@ def diagobs_noise_amplification_argument_generator(samplex, parameter_values, no
 #             samplex_arguments[f"noise_scales.{ref}"] = 0
 #     return samplex.inputs().bind(**samplex_arguments)
 
-def execute_znepea(backend, job_tbarrier_circuits, parameters_func, db_options, uinst_filter_func=None, job_db=None, optimization_level=3):
+def execute_new_peaodr(backend, job_tbarrier_circuits, parameters_func, db_options, uinst_filter_func=None, job_db=None, optimization_level=3):
+    
     znepea_options_check(db_options)
     job_tbarrier_circuits = numpy_array_of_circuits(job_tbarrier_circuits)
     job_tbarrier_circuits_shape = job_tbarrier_circuits.shape
@@ -539,6 +540,116 @@ def execute_znepea_choosing_layout(backend, job_log_barrier_circuits, parameters
         job_db.add(all_options, job_circuits, "ZNE-PEA", job_ids)
 
     return jobs
+
+
+def execute_znepeaodr_choosing_layout(backend, job_log_barrier_circuits, parameters_func, db_options, uinst_filter_func=None, job_db=None, optimization_level=3):
+    
+    znepea_options_check(db_options)
+    # Check array of circuits
+    job_log_circuits = numpy_array_of_circuits(job_log_barrier_circuits)
+    job_log_circuits_shape = job_log_circuits.shape
+    job_log_circuits = [circutils.check_and_measure_active_qubits(c) for c in job_log_circuits.flatten()]
+    batch_options = {"job_circuits_shape": job_log_circuits_shape, "cal_circuits_shape": None, "nrepetitions": 1, "repeat_cal": False}
+
+    # Transpile circuits
+    pm = generate_preset_pass_manager(backend=backend, optimization_level=optimization_level)
+    depths = np.array([circutils.depth2qb(c) for c in job_log_circuits])
+    longest_circuit_ind = np.argmax(depths)
+    transpiled_longest_circuit = pm.run(job_log_circuits[longest_circuit_ind])
+    chosen_layout = transpiled_longest_circuit.layout.final_index_layout()
+    job_circuits = circutils.transpile_circuits_with_consistent_layout(job_log_circuits, backend, layout=chosen_layout)
+    # job_circuits = circutils.transpile_circuits_with_consistent_layout(job_log_circuits, backend, None)
+    jobs = []
+    
+    # Box circuits
+    box_job_circuits = circutils.box_circuits(job_circuits, 
+                                            inject_noise_strategy="uniform_modification",
+                                            inject_noise_targets="gates",
+                                            measure_annotations="all")
+
+    box_job_circuits_unist = circutils.get_unique_boxes(box_job_circuits.tolist(), undress_boxes=True, normalize_annotations=None)
+    
+    def uinst_filter_func(uinsts):
+
+        assert len(np.unique([len(uinstructions) for uinstructions in uinsts])) == 2, "All circuits but the first one should have the same number of unique instructions"
+
+        all_equals = []
+        for j in range(3):
+            all_equal = True
+            for i in range(2, len(uinsts)):
+                all_equal = all_equal and (uinsts[i][j] == uinsts[2][j])
+                #print(all_equal)
+            all_equals.append(all_equal)
+
+        assert all(all_equals), "The box instructions are not found in the same order for every circuit"
+
+        return uinsts[2]
+    
+    box_job_circuits_unist = uinst_filter_func(box_job_circuits_unist)
+        
+    with Session(backend=backend) as session:
+
+        batch_options["batch_id"] = session.session_id
+        
+        # Run the layout benchmarks
+        #print("Running layout benchmarks...")
+        #target = benchmarks.update_target(backend, session)
+        #backend = characterization.characterize_backend(backend=backend, experiments=['readout', 'rb_2q'])
+
+        # Run dummy job to avoid idling
+        #dummy_sampler = SamplerV2(mode=session, options={"default_shots": 2**14})
+        #dummy_job = dummy_sampler.run([(dummy_circ, parameters_func(1))])
+
+        # Prepare templates, samplexes and noise injected circuits
+        print("Preparing circuits for noise learning...")
+        templates, samplexes = circutils.samplomatic_build(box_job_circuits)
+        if db_options["learner_post_selection_enabled"]:
+            # Set up post selection PM (to add PS instructions)
+            post_selection_pm = PassManager(
+                [
+                    AddSpectatorMeasures(backend.coupling_map),
+                    AddPostSelectionMeasures(x_pulse_type="rx"),
+                ]
+            )
+            templates = post_selection_pm.run(templates)
+
+        # Run the noise learner
+        print("Running noise learner...")
+        noise_learner_options = NoiseLearnerV3Options(
+            num_randomizations=db_options["learner_num_randomizations"],
+            shots_per_randomization=db_options["learner_shots_per_randomization"],
+            layer_pair_depths=db_options["learner_layer_pair_depth"],
+            post_selection={
+                "enable": db_options["learner_post_selection_enabled"],
+                "strategy": "edge",
+                "x_pulse_type": "rx"
+            })
+        noise_learner = NoiseLearnerV3(mode=session, options=noise_learner_options)
+        noise_learner_job = noise_learner.run(instructions=box_job_circuits_unist)
+        noise_maps = noise_learner_job.result().to_dict(instructions=box_job_circuits_unist, require_refs=False)
+        batch_options["noise_learner_job_id"] = noise_learner_job.job_id()
+
+        # Submit jobs
+        print("Submitting jobs...")
+        executor = Executor(mode=session)
+        for i, (template, samplex) in enumerate(zip(templates, samplexes)):
+            samplex_arguments = diagobs_noise_amplification_argument_generator(samplex, parameter_values=parameters_func(i), noise_maps=noise_maps, noise_rates=db_options["noise_factors"])
+            program = QuantumProgram(shots=db_options["pt_shots_per_randomization"])
+            program.append_samplex_item(
+                circuit=template,
+                samplex=samplex,
+                samplex_arguments=samplex_arguments,
+                shape=(db_options["pt_num_randomizations"], len(db_options["noise_factors"]))
+            )
+            jobs.append(executor.run(program))
+        
+    if job_db is not None:
+        job_ids = [job.job_id() for job in jobs]
+        all_options = (db_options if db_options is not None else {}) | batch_options
+        job_db.add(all_options, job_circuits, "ZNE-PEA", job_ids)
+
+    return jobs
+
 
 def get_backend_best_qubit_chain(backend, nqubits):
     qlists = backend.properties().general_qlists
