@@ -205,21 +205,17 @@ def many_measure_diagonal_observables(samples_dicts, diagonal_observables, confi
         expectation_values = np.array(result).reshape((*og_samples_dicts_shape, len(diagonal_observables)))
         return expectation_values
 
-def measure_observables_executor(executor_result, diagonal_observables, basis="Z", confidence=None, register_name="meas"):
+def measure_observables_executor(executor_result, diagonal_observables, basis="Z", confidence=None, register_name="meas", bootstrap_unit="pooled"):
     # Executor result shape:
     # (p_randomizations, ...custom..., parameters, shots, nregisters)
     # Final shape
     # (...custom..., nobservables)
-    if confidence is not None:
-        raise NotImplementedError("Confidence intervals are not implemented yet.")
-    
     if isinstance(diagonal_observables, Pauli):
         diagonal_observables = [diagonal_observables]
     raw_register = executor_result[register_name]
     correction_flips = executor_result[f"measurement_flips.{register_name}"]
     corrected_samples = (raw_register ^ correction_flips).reshape((-1, raw_register.shape[-1]))
 
-    # strings_expectation_values = np.zeros((corrected_samples.shape[0], len(diagonal_observables)))
     observables_mask = np.array([[int(str(opel) == basis) for opel in invert_pauli_order(observable)] for observable in diagonal_observables])
     observables_phases = np.array([1j**obs.phase for obs in diagonal_observables])
     if np.any(observables_phases.imag != 0):
@@ -228,8 +224,22 @@ def measure_observables_executor(executor_result, diagonal_observables, basis="Z
     strings_expectation_values = (corrected_samples @ observables_mask.T) % 2
     strings_expectation_values = 1 - 2*strings_expectation_values
     strings_expectation_values = strings_expectation_values * observables_phases
-    strings_expectation_values = strings_expectation_values.reshape((*raw_register.shape[:-1], len(diagonal_observables)))
-    expectation_values = np.mean(strings_expectation_values, axis=(0, -2))
+    # per_shot_signed shape: (p_randomizations, ...custom..., shots, nobs); every shot is kept (±1).
+    per_shot_signed = strings_expectation_values.reshape((*raw_register.shape[:-1], len(diagonal_observables)))
+    expectation_values = np.mean(per_shot_signed, axis=(0, -2))
+
+    if confidence is not None:
+        # Bootstrap CI via the shared per-shot helper, so the bootstrap_unit kwarg works
+        # uniformly across pea / pea-odr / pea-odr-trex-ps[-gsc]. The aggregator is just
+        # the unweighted mean over the (p_rand, shots) axes — no TREX, no postselection.
+        from hardware.utils.bootstrap import bootstrap_per_shot_aggregate
+        def aggregate(t):
+            return np.mean(t, axis=(0, -2))
+        confidence_intervals = bootstrap_per_shot_aggregate(
+            per_shot_signed.real, aggregate, confidence=confidence, bootstrap_unit=bootstrap_unit,
+        )
+        return expectation_values, confidence_intervals
+
     return expectation_values
 
 def print_postselection_retention(mask, label=None, noise_factor_labels=None, header_suffix="post-selection retention"):
@@ -251,7 +261,7 @@ def print_postselection_retention(mask, label=None, noise_factor_labels=None, he
     print("\n".join(lines))
 
 
-def measure_observables_postselection(executor_result, circuit, backend, diagonal_observables, trex_scale_factors=None, postselection_strategy="edge", basis="Z", register_name="meas", verbose=True, label=None, noise_factor_labels=None):
+def measure_observables_postselection(executor_result, circuit, backend, diagonal_observables, trex_scale_factors=None, postselection_strategy="edge", basis="Z", register_name="meas", verbose=True, label=None, noise_factor_labels=None, confidence=None, bootstrap_unit="pooled"):
 
     if isinstance(diagonal_observables, Pauli):
         diagonal_observables = [diagonal_observables]
@@ -271,7 +281,6 @@ def measure_observables_postselection(executor_result, circuit, backend, diagona
     raw_register = executor_result[register_name]
     correction_flips = executor_result[f"measurement_flips.{register_name}"]
     corrected_samples = (raw_register ^ correction_flips).reshape((-1, raw_register.shape[-1]))
-    # flagged_samples = np.concatenate((corrected_samples, mask[..., np.newaxis]), axis=-1) # Flag is last bit
 
     observables_mask = np.array([[int(str(opel) == basis) for opel in invert_pauli_order(observable)] for observable in diagonal_observables])
     observables_phases = np.array([1j**obs.phase for obs in diagonal_observables])
@@ -279,27 +288,48 @@ def measure_observables_postselection(executor_result, circuit, backend, diagona
     if np.any(observables_phases.imag != 0):
         raise ValueError("Diagonal observables must have +-1 phases")
     observables_phases = observables_phases.real
-    strings_expectation_values = (corrected_samples @ observables_mask.T) % 2
-    strings_expectation_values = (1 - 2*strings_expectation_values) * mask.reshape(-1, 1) * observables_phases
-    strings_expectation_values = strings_expectation_values.reshape((*raw_register.shape[:-1], len(diagonal_observables)))
 
-    # Per-randomization, per-noise-factor mean over surviving shots, NaN-safe for zero-kept twirls
-    safe_num_kept = np.where(num_shots_kept > 0, num_shots_kept, 1)
-    strings_expectation_values = np.sum(strings_expectation_values, axis=-2) / safe_num_kept[..., np.newaxis]
-    strings_expectation_values = np.where(num_shots_kept[..., np.newaxis] > 0, strings_expectation_values, np.nan)
+    # Per-shot ±1/0 contribution (zero for non-surviving shots). Shape (R, ..., S, O).
+    per_shot_signed = (corrected_samples @ observables_mask.T) % 2
+    per_shot_signed = (1 - 2*per_shot_signed) * mask.reshape(-1, 1) * observables_phases
+    per_shot_signed = per_shot_signed.reshape((*raw_register.shape[:-1], len(diagonal_observables)))
 
-    # Weight each randomization by its kept-shot fraction (independently per noise factor),
-    # so randomizations with more surviving shots dominate. Zero-kept twirls contribute zero weight.
-    weights = num_shots_kept / np.sum(num_shots_kept, axis=0, keepdims=True)
-    strings_expectation_values = np.nansum(
-        strings_expectation_values * weights[..., np.newaxis], axis=0
-    ) * trex_scale_factors
-    
-    return strings_expectation_values
+    def aggregate(per_shot_tensor):
+        # mirrors the original aggregation, recomputing num_shots_kept from the mask in the
+        # tensor itself: a shot with all-zero contribution across observables corresponds
+        # to a non-surviving shot. (The mask is the same per shot regardless of observable.)
+        # We can derive per-shot survival from any column of `mask`-applied tensor — but
+        # since the mask was zero-applied uniformly across observables, a shot survives iff
+        # it contributes a nonzero value to ANY observable. To be robust to per-observable
+        # cancellation, recompute survival by checking whether the row was zeroed.
+        # Easier: recompute kept-counts per resample as the count of nonzero contribution
+        # rows. Since each surviving shot contributes ±1 (never 0) to every observable,
+        # we can use any single observable column.
+        # Use observable 0; if all observables are degenerate at +0 for some shots, this
+        # would break, but for diagonal Pauli observables a surviving shot always contributes
+        # ±1.
+        per_shot_kept = (per_shot_tensor[..., 0] != 0)  # (R, ..., S)
+        nkept = np.sum(per_shot_kept, axis=-1)          # (R, ...)
+        safe = np.where(nkept > 0, nkept, 1)
+        per_rand_means = np.sum(per_shot_tensor, axis=-2) / safe[..., np.newaxis]
+        per_rand_means = np.where(nkept[..., np.newaxis] > 0, per_rand_means, np.nan)
+        denom = np.sum(nkept, axis=0, keepdims=True)
+        denom = np.where(denom > 0, denom, 1)
+        weights = nkept / denom
+        return np.nansum(per_rand_means * weights[..., np.newaxis], axis=0) * trex_scale_factors
 
-def many_measure_observables_executor(executor_results, diagonal_observables, basis="Z", confidence=None, register_name="meas"):
-    if confidence is not None:
-        raise NotImplementedError("Confidence intervals are not implemented yet.")
+    expectation_values = aggregate(per_shot_signed)
+
+    if confidence is None:
+        return expectation_values
+
+    from hardware.utils.bootstrap import bootstrap_per_shot_aggregate
+    confidence_intervals = bootstrap_per_shot_aggregate(
+        per_shot_signed, aggregate, confidence=confidence, bootstrap_unit=bootstrap_unit,
+    )
+    return expectation_values, confidence_intervals
+
+def many_measure_observables_executor(executor_results, diagonal_observables, basis="Z", confidence=None, register_name="meas", bootstrap_unit="pooled"):
     nqubits = len(diagonal_observables[0])
     executor_results = np.array(executor_results)
     for observable in diagonal_observables:
@@ -313,11 +343,17 @@ def many_measure_observables_executor(executor_results, diagonal_observables, ba
     shmem = SharedMemory(create=True, size=executor_results.nbytes)
     shared_samples = np.ndarray(executor_results.shape, dtype=object, buffer=shmem.buf)
     shared_samples[:] = executor_results
-    measure_args = [(measure_observables_executor, shmem.name, og_results_shape, i, (diagonal_observables, basis, confidence)) for i in range(len(executor_results))]
+    # fargs is unpacked positionally by threadsafe_samples_transfer into measure_observables_executor's
+    # signature: (diagonal_observables, basis, confidence, register_name, bootstrap_unit).
+    measure_args = [(measure_observables_executor, shmem.name, og_results_shape, i, (diagonal_observables, basis, confidence, register_name, bootstrap_unit)) for i in range(len(executor_results))]
     with mp.get_context("fork").Pool(processes=mp.cpu_count()//2) as pool:
         result = pool.starmap(threadsafe_samples_transfer, measure_args)
     shmem.close()
     shmem.unlink()
+    if confidence is not None:
+        expectation_values = np.array([r[0] for r in result], dtype=object).reshape((*og_results_shape, *result[0][0].shape))
+        confidence_intervals = np.array([r[1] for r in result], dtype=object).reshape((*og_results_shape, *result[0][1].shape))
+        return expectation_values, confidence_intervals
     expectation_values = np.array(result, dtype=object).reshape((*og_results_shape, *result[0].shape))
     return expectation_values
     

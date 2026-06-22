@@ -14,6 +14,7 @@ import multiprocessing as mp
 import numpy as np
 import pickle
 import os
+from scipy.stats import norm as _scipy_norm
 
 class WorkflowError(Exception):
     pass
@@ -675,10 +676,12 @@ def postprocessing_joana(executor_jobs, job_data, observables_genfuncs, postsele
            service,
            mitigation="pea-odr",
            flip_threshold=1, flipped_syndromes=None, minimum_shots=300000,
+           disable_trex=False,
            zne_func=znemod.perform_linear_zne,
            zne_noise_factor_indices=None,
            guess=False,
            confidence=None,
+           bootstrap_unit="pooled",
            return_samples=False,
            verbose=False):
     
@@ -727,19 +730,31 @@ def postprocessing_joana(executor_jobs, job_data, observables_genfuncs, postsele
                 shape parameters fixed to the cal values, freeing only the
                 intercept term.
 
-        The resulting cal-guided intercepts replace ``zne_observables``. Useful
-        when the cal curve is cleaner than the sim curve and the shape of the
-        noise vs. noise-factor dependence is shared between sim and cal.
+        The resulting cal-guided intercepts replace ``zne_observables``. 
     confidence : float in (0, 1), optional
-        Confidence level (e.g. ``0.95``) used by
-        ``measure.many_measure_observables_executor`` to bootstrap intervals on
-        sim and cal observables. The intervals are propagated through the ODR
-        renormalization, and the ZNE step also returns ``[intercept ± std_err]``
-        intervals (±1σ, matching :func:`odrzne`'s convention). Currently
-        supported only for ``mitigation in {'pea-odr', 'pea'}``; the
-        ``'pea-odr-trex-ps'`` and ``'pea-odr-trex-ps-gsc'`` branches raise
-        ``NotImplementedError`` because the underlying measurement helpers
-        don't propagate confidence yet.
+        Confidence level (e.g. ``0.95``) used to bootstrap intervals on sim
+        and cal observables. The bootstrap convention is shared across all
+        mitigations and controlled by ``bootstrap_unit`` (see below). The
+        intervals are propagated through the ODR renormalization. The ZNE
+        step performs a weighted fit using the upstream bootstrap intervals
+        as 1σ measurement errors
+        (``sigma = (upper - lower) / (2 * z_alpha)``) and returns CIs at the
+        same confidence level (``[intercept ± z_alpha * std_err]``), so all
+        returned intervals share the same convention.
+    bootstrap_unit : {"pooled", "randomizations"}, default "pooled"
+        Resampling unit for the bootstrap, applied uniformly across all four
+        mitigations (no postselection in ``'pea'`` / ``'pea-odr'``;
+        post-selection + optional GSC for the trex-ps variants — bootstrap
+        runs on the kept shots in either case):
+
+        * ``"pooled"`` — all kept shots in a noise-factor cell form one
+          dataset; resample shots with replacement (binomial-equivalent).
+          Captures shot noise only.
+        * ``"randomizations"`` — the randomization (Pauli twirl) is the
+          independent unit; resample R per-randomization (kept-fraction
+          weighted) means with replacement. Captures between-twirl
+          variability, which typically dominates uncertainty in PEA / TREX
+          estimators.
     return_samples : bool, default False
         If True, also return the raw sim ``PrimitiveResult`` objects.
     verbose : bool, default False
@@ -762,13 +777,6 @@ def postprocessing_joana(executor_jobs, job_data, observables_genfuncs, postsele
     if mitigation not in _VALID_MITIGATIONS:
         raise ValueError(f"mitigation must be one of {_VALID_MITIGATIONS}, got {mitigation!r}")
 
-    if confidence is not None and mitigation in ('pea-odr-trex-ps', 'pea-odr-trex-ps-gsc'):
-        raise NotImplementedError(
-            f"Confidence intervals are not yet implemented for mitigation={mitigation!r}; "
-            f"the underlying measurement helpers (measure_observables_postselection / "
-            f"gauge_recovery_and_measure_executor) do not propagate confidence yet. "
-            f"Supported with confidence: 'pea-odr', 'pea'."
-        )
 
     # Local printing helpers, scoped to this function
     def _say(msg):
@@ -779,6 +787,19 @@ def postprocessing_joana(executor_jobs, job_data, observables_genfuncs, postsele
         if verbose:
             bar = "─" * (len(title) + 4)
             print(f"\n{bar}\n  {title}\n{bar}")
+
+    def _abs_cal(cal_mean, cal_ci):
+        # Cal observables are physically expected near +1; tiny negatives come from sampling
+        # noise. compute_depolarizing_probability already takes |O_cal|, so the CI fed into
+        # renormalize_observable must be expressed in the same |·| frame: reflect the CI
+        # through 0 where the un-abs'd mean was negative, then re-sort so [lo, hi] ascend.
+        cal_mean = np.asarray(cal_mean, dtype=float)
+        if cal_ci is None:
+            return np.abs(cal_mean), None
+        cal_ci = np.asarray(cal_ci, dtype=float)
+        flip = (cal_mean < 0)[..., None]                  # broadcast over the trailing [lo, hi] axis
+        reflected = np.where(flip, -cal_ci[..., ::-1], cal_ci)
+        return np.abs(cal_mean), reflected
 
     try:
         noise_factors = np.array(job_data["noise_factors"])
@@ -817,108 +838,34 @@ def postprocessing_joana(executor_jobs, job_data, observables_genfuncs, postsele
         _say(f"Minimum fraction of shots kept in noise learning experiments: {nl_min_kept:.2f}")
 
     # ----- Mitigation dispatch -----
-    if mitigation == 'pea-odr-trex-ps-gsc':
-        # Gauge sector correction + TREX + non-Markovian PS
-        trex_noise_model = nl_data[-1].to_pauli_lindblad_map()
-        rescale_factors = trex.get_scale_factors(trex_noise_model, diagonal_observables_ops)
-        backend = service.backend(job_data["backend"])
-        postselection_operators, diagonal_observables_ops, non_diagonal_observables_ops, basis = ps.initialize_postselection(nqubits, postselection_genfunc, observables_genfuncs)
+    if mitigation == 'pea':
+        # Plain measurement (no TREX, no PS, no GSC) -- "pea" or "pea-odr"
+        _section("SIM/CAL · plain measurement")
+        _say("Measuring sim and cal observables")
+        if confidence is not None:
+            raw_sim_measured_observables, raw_sim_measured_observables_confidence = measure.many_measure_observables_executor(sim_results[succesful_sim_mask], diagonal_observables_ops, confidence=confidence, bootstrap_unit=bootstrap_unit)
+            raw_cal_measured_observables, raw_cal_measured_observables_confidence = measure.many_measure_observables_executor(cal_results[succesful_cal_mask], diagonal_observables_ops, confidence=confidence, bootstrap_unit=bootstrap_unit)
+            raw_sim_measured_observables_confidence = np.swapaxes(raw_sim_measured_observables_confidence, 0, 1)
+            raw_cal_measured_observables_confidence = np.swapaxes(raw_cal_measured_observables_confidence, 0, 1)
+        else:
+            raw_sim_measured_observables = measure.many_measure_observables_executor(sim_results[succesful_sim_mask], diagonal_observables_ops)
+            raw_cal_measured_observables = measure.many_measure_observables_executor(cal_results[succesful_cal_mask], diagonal_observables_ops)
+        raw_sim_measured_observables = np.swapaxes(raw_sim_measured_observables, 0, 1)
+        raw_cal_measured_observables = np.swapaxes(raw_cal_measured_observables, 0, 1)
 
-        _section("SIM · GSC + TREX + non-Markovian PS")
-        raw_sim_measured_observables = []
-        for i, (sim_result, sim_job) in enumerate(zip(sim_results, sim_jobs)):
-            circuit = executorutils.load_circuit_from_job(sim_job)
-            raw_sim_measured_observables.append(
-                ps.gauge_recovery_and_measure_executor(
-                    sim_result, circuit, backend, postselection_operators, diagonal_observables_ops,
-                    trex_scale_factors=rescale_factors, postselection_strategy="edge", basis="Z",
-                    flip_threshold=flip_threshold, flipped_syndromes=flipped_syndromes,
-                    minimum_shots=minimum_shots, register_name="meas",
-                    verbose=verbose, label=f"sim · job {i}", noise_factor_labels=nf_labels,
-                )
-            )
-        raw_sim_measured_observables = np.swapaxes(np.array(raw_sim_measured_observables), 0, 1)
-
-        _section("CAL · GSC + TREX + non-Markovian PS")
-        raw_cal_measured_observables = []
-        for i, (cal_result, cal_job) in enumerate(zip(cal_results, cal_jobs)):
-            circuit = executorutils.load_circuit_from_job(cal_job)
-            raw_cal_measured_observables.append(
-                ps.gauge_recovery_and_measure_executor(
-                    cal_result, circuit, backend, postselection_operators, diagonal_observables_ops,
-                    trex_scale_factors=rescale_factors, postselection_strategy="edge", basis="Z",
-                    flip_threshold=flip_threshold, flipped_syndromes=flipped_syndromes,
-                    minimum_shots=minimum_shots, register_name="meas",
-                    verbose=verbose, label=f"cal · job {i}", noise_factor_labels=nf_labels,
-                )
-            )
-        raw_cal_measured_observables = np.swapaxes(np.array(raw_cal_measured_observables), 0, 1)
-
-        _section("ODR depolarizing-rate correction")
-        clean_observables = np.full(raw_sim_measured_observables.shape, np.nan)
-        for i in range(len(noise_factors)):
-            raw_cal_measured_observables_nf = np.abs(raw_cal_measured_observables[i])
-            raw_sim_measured_observables_nf = raw_sim_measured_observables[i]
-            p_arr = odr.compute_depolarizing_probability(raw_cal_measured_observables_nf, 1, 0, nqubits)
-            clean_observables_nf = odr.renormalize_observable(raw_sim_measured_observables_nf, p_arr, 0, nqubits, expected_observable_arr=1)
-            clean_observables[i] = clean_observables_nf
-        _say(f"Applied ODR correction over {len(noise_factors)} noise factors")
+        clean_observables = raw_sim_measured_observables.copy()
         clean_cal_observables = raw_cal_measured_observables.copy()
-        
-    if mitigation == "pea-odr-trex-ps":
-        # TREX + non-Markovian post-selection
-        trex_noise_model = nl_data[-1].to_pauli_lindblad_map()
-        rescale_factors = trex.get_scale_factors(trex_noise_model, diagonal_observables_ops)
-        backend = service.backend(job_data["backend"])
-
-        _section("SIM · TREX + non-Markovian PS")
-        sim_jobs_circuits = [executorutils.load_circuit_from_job(job) for job in sim_jobs]
-        raw_sim_measured_observables = []
-        for i in range(len(sim_jobs_circuits)):
-            if not succesful_sim_mask[i]:
-                raw_sim_measured_observables.append(np.full((len(diagonal_observables_ops),), np.nan))
-                continue
-            this_obs = measure.measure_observables_postselection(
-                sim_results[i], sim_jobs_circuits[i], backend, diagonal_observables_ops,
-                trex_scale_factors=rescale_factors,
-                verbose=verbose, label=f"sim · job {i}", noise_factor_labels=nf_labels,
-            )
-            raw_sim_measured_observables.append(this_obs)
-        raw_sim_measured_observables = np.swapaxes(np.array(raw_sim_measured_observables), 0, 1)
-
-        _section("CAL · TREX + non-Markovian PS")
-        cal_jobs_circuits = [executorutils.load_circuit_from_job(job) for job in cal_jobs]
-        raw_cal_measured_observables = []
-        for i in range(len(cal_jobs_circuits)):
-            if not succesful_cal_mask[i]:
-                raw_cal_measured_observables.append(np.full((len(diagonal_observables_ops),), np.nan))
-                continue
-            this_obs = measure.measure_observables_postselection(
-                cal_results[i], cal_jobs_circuits[i], backend, diagonal_observables_ops,
-                trex_scale_factors=rescale_factors,
-                verbose=verbose, label=f"cal · job {i}", noise_factor_labels=nf_labels,
-            )
-            raw_cal_measured_observables.append(this_obs)
-        raw_cal_measured_observables = np.swapaxes(np.array(raw_cal_measured_observables), 0, 1)
-
-        _section("ODR depolarizing-rate correction")
-        clean_observables = np.full(raw_sim_measured_observables.shape, np.nan)
-        for i in range(len(noise_factors)):
-            raw_cal_measured_observables_nf = np.abs(raw_cal_measured_observables[i])
-            raw_sim_measured_observables_nf = raw_sim_measured_observables[i]
-            p_arr = odr.compute_depolarizing_probability(raw_cal_measured_observables_nf, 1, 0, nqubits)
-            clean_observables_nf = odr.renormalize_observable(raw_sim_measured_observables_nf, p_arr, 0, nqubits, expected_observable_arr=1)
-            clean_observables[i] = clean_observables_nf
-        _say(f"Applied ODR correction over {len(noise_factors)} noise factors")
-        clean_cal_observables = raw_cal_measured_observables.copy()
+        if confidence is not None:
+            clean_observables_confidence = raw_sim_measured_observables_confidence.copy()
+            clean_cal_observables_confidence = raw_cal_measured_observables_confidence.copy()
 
     if mitigation == 'pea-odr':
         # Plain measurement (no TREX, no PS, no GSC) -- "pea" or "pea-odr"
         _section("SIM/CAL · plain measurement")
         _say("Measuring sim and cal observables")
         if confidence is not None:
-            raw_sim_measured_observables, raw_sim_measured_observables_confidence = measure.many_measure_observables_executor(sim_results[succesful_sim_mask], diagonal_observables_ops, confidence=confidence)
-            raw_cal_measured_observables, raw_cal_measured_observables_confidence = measure.many_measure_observables_executor(cal_results[succesful_cal_mask], diagonal_observables_ops, confidence=confidence)
+            raw_sim_measured_observables, raw_sim_measured_observables_confidence = measure.many_measure_observables_executor(sim_results[succesful_sim_mask], diagonal_observables_ops, confidence=confidence, bootstrap_unit=bootstrap_unit)
+            raw_cal_measured_observables, raw_cal_measured_observables_confidence = measure.many_measure_observables_executor(cal_results[succesful_cal_mask], diagonal_observables_ops, confidence=confidence, bootstrap_unit=bootstrap_unit)
             raw_sim_measured_observables_confidence = np.swapaxes(raw_sim_measured_observables_confidence, 0, 1)
             raw_cal_measured_observables_confidence = np.swapaxes(raw_cal_measured_observables_confidence, 0, 1)
         else:
@@ -932,14 +879,19 @@ def postprocessing_joana(executor_jobs, job_data, observables_genfuncs, postsele
         if confidence is not None:
             clean_observables_confidence = np.full((*raw_sim_measured_observables.shape, 2), np.nan)
         for i in range(len(noise_factors)):
-            raw_cal_measured_observables_nf = np.abs(raw_cal_measured_observables[i])
+            cal_mean_nf, cal_ci_nf = _abs_cal(
+                raw_cal_measured_observables[i],
+                raw_cal_measured_observables_confidence[i] if confidence is not None else None,
+            )
             raw_sim_measured_observables_nf = raw_sim_measured_observables[i]
-            p_arr = odr.compute_depolarizing_probability(raw_cal_measured_observables_nf, 1, 0, nqubits)
+            p_arr = odr.compute_depolarizing_probability(cal_mean_nf, 1, 0, nqubits)
             if confidence is not None:
                 clean_observables_nf, clean_observables_confidence_nf = odr.renormalize_observable(
                     raw_sim_measured_observables_nf, p_arr, 0, nqubits,
                     expected_observable_arr=1,
                     observable_confidence=raw_sim_measured_observables_confidence[i],
+                    cal_observable_arr=cal_mean_nf,
+                    cal_confidence=cal_ci_nf,
                 )
                 clean_observables[i] = clean_observables_nf
                 clean_observables_confidence[i] = clean_observables_confidence_nf
@@ -951,26 +903,177 @@ def postprocessing_joana(executor_jobs, job_data, observables_genfuncs, postsele
         if confidence is not None:
             clean_cal_observables_confidence = raw_cal_measured_observables_confidence.copy()
 
-    if mitigation == 'pea':
+    if mitigation == 'pea-odr-trex-ps-gsc':
+        # Gauge sector correction + TREX + non-Markovian PS
+        trex_noise_model = nl_data[-1].to_pauli_lindblad_map()
+        rescale_factors = trex.get_scale_factors(trex_noise_model, diagonal_observables_ops) 
+        if disable_trex:
+            rescale_factors = None 
+        backend = service.backend(job_data["backend"])
+        postselection_operators, diagonal_observables_ops, non_diagonal_observables_ops, basis = ps.initialize_postselection(nqubits, postselection_genfunc, observables_genfuncs)
 
-        # Plain measurement (no TREX, no PS, no GSC) -- "pea" or "pea-odr"
-        _section("SIM/CAL · plain measurement")
-        _say("Measuring sim and cal observables")
+        _section("SIM · GSC + TREX + non-Markovian PS")
+        raw_sim_measured_observables = []
+        raw_sim_measured_observables_confidence = [] if confidence is not None else None
+        for i, (sim_result, sim_job) in enumerate(zip(sim_results, sim_jobs)):
+            circuit = executorutils.load_circuit_from_job(sim_job)
+            out = ps.gauge_recovery_and_measure_executor(
+                sim_result, circuit, backend, postselection_operators, diagonal_observables_ops,
+                trex_scale_factors=rescale_factors, postselection_strategy="edge", basis="Z",
+                flip_threshold=flip_threshold, flipped_syndromes=flipped_syndromes,
+                minimum_shots=minimum_shots, register_name="meas",
+                verbose=verbose, label=f"sim · job {i}", noise_factor_labels=nf_labels,
+                confidence=confidence, bootstrap_unit=bootstrap_unit,
+            )
+            if confidence is not None:
+                obs_vals, obs_ci = out
+                raw_sim_measured_observables.append(obs_vals)
+                raw_sim_measured_observables_confidence.append(obs_ci)
+            else:
+                raw_sim_measured_observables.append(out)
+        raw_sim_measured_observables = np.swapaxes(np.array(raw_sim_measured_observables), 0, 1)
         if confidence is not None:
-            raw_sim_measured_observables, raw_sim_measured_observables_confidence = measure.many_measure_observables_executor(sim_results[succesful_sim_mask], diagonal_observables_ops, confidence=confidence)
-            raw_cal_measured_observables, raw_cal_measured_observables_confidence = measure.many_measure_observables_executor(cal_results[succesful_cal_mask], diagonal_observables_ops, confidence=confidence)
-            raw_sim_measured_observables_confidence = np.swapaxes(raw_sim_measured_observables_confidence, 0, 1)
-            raw_cal_measured_observables_confidence = np.swapaxes(raw_cal_measured_observables_confidence, 0, 1)
-        else:
-            raw_sim_measured_observables = measure.many_measure_observables_executor(sim_results[succesful_sim_mask], diagonal_observables_ops)
-            raw_cal_measured_observables = measure.many_measure_observables_executor(cal_results[succesful_cal_mask], diagonal_observables_ops)
-        raw_sim_measured_observables = np.swapaxes(raw_sim_measured_observables, 0, 1)
-        raw_cal_measured_observables = np.swapaxes(raw_cal_measured_observables, 0, 1)
+            raw_sim_measured_observables_confidence = np.swapaxes(np.array(raw_sim_measured_observables_confidence), 0, 1)
 
-        clean_observables = raw_sim_measured_observables.copy()
+        _section("CAL · GSC + TREX + non-Markovian PS")
+        raw_cal_measured_observables = []
+        raw_cal_measured_observables_confidence = [] if confidence is not None else None
+        for i, (cal_result, cal_job) in enumerate(zip(cal_results, cal_jobs)):
+            circuit = executorutils.load_circuit_from_job(cal_job)
+            out = ps.gauge_recovery_and_measure_executor(
+                cal_result, circuit, backend, postselection_operators, diagonal_observables_ops,
+                trex_scale_factors=rescale_factors, postselection_strategy="edge", basis="Z",
+                flip_threshold=flip_threshold, flipped_syndromes=flipped_syndromes,
+                minimum_shots=minimum_shots, register_name="meas",
+                verbose=verbose, label=f"cal · job {i}", noise_factor_labels=nf_labels,
+                confidence=confidence, bootstrap_unit=bootstrap_unit,
+            )
+            if confidence is not None:
+                obs_vals, obs_ci = out
+                raw_cal_measured_observables.append(obs_vals)
+                raw_cal_measured_observables_confidence.append(obs_ci)
+            else:
+                raw_cal_measured_observables.append(out)
+        raw_cal_measured_observables = np.swapaxes(np.array(raw_cal_measured_observables), 0, 1)
+        if confidence is not None:
+            raw_cal_measured_observables_confidence = np.swapaxes(np.array(raw_cal_measured_observables_confidence), 0, 1)
+
+        _section("ODR depolarizing-rate correction")
+        clean_observables = np.full(raw_sim_measured_observables.shape, np.nan)
+        if confidence is not None:
+            clean_observables_confidence = np.full((*raw_sim_measured_observables.shape, 2), np.nan)
+        for i in range(len(noise_factors)):
+            cal_mean_nf, cal_ci_nf = _abs_cal(
+                raw_cal_measured_observables[i],
+                raw_cal_measured_observables_confidence[i] if confidence is not None else None,
+            )
+            raw_sim_measured_observables_nf = raw_sim_measured_observables[i]
+            p_arr = odr.compute_depolarizing_probability(cal_mean_nf, 1, 0, nqubits)
+            if confidence is not None:
+                clean_observables_nf, clean_observables_confidence_nf = odr.renormalize_observable(
+                    raw_sim_measured_observables_nf, p_arr, 0, nqubits,
+                    expected_observable_arr=1,
+                    observable_confidence=raw_sim_measured_observables_confidence[i],
+                    cal_observable_arr=cal_mean_nf,
+                    cal_confidence=cal_ci_nf,
+                )
+                clean_observables[i] = clean_observables_nf
+                clean_observables_confidence[i] = clean_observables_confidence_nf
+            else:
+                clean_observables_nf = odr.renormalize_observable(raw_sim_measured_observables_nf, p_arr, 0, nqubits, expected_observable_arr=1)
+                clean_observables[i] = clean_observables_nf
+        _say(f"Applied ODR correction over {len(noise_factors)} noise factors")
         clean_cal_observables = raw_cal_measured_observables.copy()
         if confidence is not None:
-            clean_observables_confidence = raw_sim_measured_observables_confidence.copy()
+            clean_cal_observables_confidence = raw_cal_measured_observables_confidence.copy()
+
+    if mitigation == "pea-odr-trex-ps":
+        # TREX + non-Markovian post-selection
+        trex_noise_model = nl_data[-1].to_pauli_lindblad_map()
+        rescale_factors = trex.get_scale_factors(trex_noise_model, diagonal_observables_ops)
+        if disable_trex:
+            rescale_factors = None
+        backend = service.backend(job_data["backend"])
+
+        _section("SIM · TREX + non-Markovian PS")
+        sim_jobs_circuits = [executorutils.load_circuit_from_job(job) for job in sim_jobs]
+        raw_sim_measured_observables = []
+        raw_sim_measured_observables_confidence = [] if confidence is not None else None
+        for i in range(len(sim_jobs_circuits)):
+            if not succesful_sim_mask[i]:
+                raw_sim_measured_observables.append(np.full((len(noise_factors), len(diagonal_observables_ops)), np.nan))
+                if confidence is not None:
+                    raw_sim_measured_observables_confidence.append(np.full((len(noise_factors), len(diagonal_observables_ops), 2), np.nan))
+                continue
+            out = measure.measure_observables_postselection(
+                sim_results[i], sim_jobs_circuits[i], backend, diagonal_observables_ops,
+                trex_scale_factors=rescale_factors,
+                verbose=verbose, label=f"sim · job {i}", noise_factor_labels=nf_labels,
+                confidence=confidence, bootstrap_unit=bootstrap_unit,
+            )
+            if confidence is not None:
+                obs_vals, obs_ci = out
+                raw_sim_measured_observables.append(obs_vals)
+                raw_sim_measured_observables_confidence.append(obs_ci)
+            else:
+                raw_sim_measured_observables.append(out)
+        raw_sim_measured_observables = np.swapaxes(np.array(raw_sim_measured_observables), 0, 1)
+        if confidence is not None:
+            raw_sim_measured_observables_confidence = np.swapaxes(np.array(raw_sim_measured_observables_confidence), 0, 1)
+
+        _section("CAL · TREX + non-Markovian PS")
+        cal_jobs_circuits = [executorutils.load_circuit_from_job(job) for job in cal_jobs]
+        raw_cal_measured_observables = []
+        raw_cal_measured_observables_confidence = [] if confidence is not None else None
+        for i in range(len(cal_jobs_circuits)):
+            if not succesful_cal_mask[i]:
+                raw_cal_measured_observables.append(np.full((len(noise_factors), len(diagonal_observables_ops)), np.nan))
+                if confidence is not None:
+                    raw_cal_measured_observables_confidence.append(np.full((len(noise_factors), len(diagonal_observables_ops), 2), np.nan))
+                continue
+            out = measure.measure_observables_postselection(
+                cal_results[i], cal_jobs_circuits[i], backend, diagonal_observables_ops,
+                trex_scale_factors=rescale_factors,
+                verbose=verbose, label=f"cal · job {i}", noise_factor_labels=nf_labels,
+                confidence=confidence, bootstrap_unit=bootstrap_unit,
+            )
+            if confidence is not None:
+                obs_vals, obs_ci = out
+                raw_cal_measured_observables.append(obs_vals)
+                raw_cal_measured_observables_confidence.append(obs_ci)
+            else:
+                raw_cal_measured_observables.append(out)
+        raw_cal_measured_observables = np.swapaxes(np.array(raw_cal_measured_observables), 0, 1)
+        if confidence is not None:
+            raw_cal_measured_observables_confidence = np.swapaxes(np.array(raw_cal_measured_observables_confidence), 0, 1)
+
+        _section("ODR depolarizing-rate correction")
+        clean_observables = np.full(raw_sim_measured_observables.shape, np.nan)
+        if confidence is not None:
+            clean_observables_confidence = np.full((*raw_sim_measured_observables.shape, 2), np.nan)
+        for i in range(len(noise_factors)):
+            cal_mean_nf, cal_ci_nf = _abs_cal(
+                raw_cal_measured_observables[i],
+                raw_cal_measured_observables_confidence[i] if confidence is not None else None,
+            )
+            raw_sim_measured_observables_nf = raw_sim_measured_observables[i]
+            p_arr = odr.compute_depolarizing_probability(cal_mean_nf, 1, 0, nqubits)
+            if confidence is not None:
+                clean_observables_nf, clean_observables_confidence_nf = odr.renormalize_observable(
+                    raw_sim_measured_observables_nf, p_arr, 0, nqubits,
+                    expected_observable_arr=1,
+                    observable_confidence=raw_sim_measured_observables_confidence[i],
+                    cal_observable_arr=cal_mean_nf,
+                    cal_confidence=cal_ci_nf,
+                )
+                clean_observables[i] = clean_observables_nf
+                clean_observables_confidence[i] = clean_observables_confidence_nf
+            else:
+                clean_observables_nf = odr.renormalize_observable(raw_sim_measured_observables_nf, p_arr, 0, nqubits, expected_observable_arr=1)
+                clean_observables[i] = clean_observables_nf
+        _say(f"Applied ODR correction over {len(noise_factors)} noise factors")
+        clean_cal_observables = raw_cal_measured_observables.copy()
+        if confidence is not None:
             clean_cal_observables_confidence = raw_cal_measured_observables_confidence.copy()
 
     # ----- ZNE extrapolation -----
@@ -992,18 +1095,32 @@ def postprocessing_joana(executor_jobs, job_data, observables_genfuncs, postsele
         _say(f"Extrapolating using all noise factors {selected_for_print}")
     zne_observables = np.full(raw_observables_shape[1::], np.nan)
     if confidence is not None:
-        # ±1σ interval, matching the convention used in `odrzne`
+        # CI at the same `confidence` level as the upstream bootstrap intervals.
         zne_observables_confidence = np.full((*raw_observables_shape[1::], 2), np.nan)
+        z_alpha = float(_scipy_norm.ppf(1 - (1 - confidence)/2))
     for inds in np.ndindex(clean_observables.shape[1::]):
         observables_for_reg = list(clean_observables[zne_indices, *inds])
         if np.isnan(observables_for_reg).any():
             zne_observables[inds] = np.nan
+            if confidence is not None:
+                zne_observables_confidence[inds] = np.nan
         else:
-            zne_results = zne_func(selected_noise_factors, observables_for_reg)
+            if confidence is not None:
+                ci_for_reg = np.asarray(clean_observables_confidence[zne_indices, *inds, :], dtype=float)
+                sigma_for_reg = (ci_for_reg[..., 1] - ci_for_reg[..., 0]) / (2 * z_alpha)
+                # Guard against zero/negative sigma (would make curve_fit divide by zero).
+                if not np.all(np.isfinite(sigma_for_reg)) or np.any(sigma_for_reg <= 0):
+                    zne_observables[inds] = np.nan
+                    zne_observables_confidence[inds] = np.nan
+                    continue
+                zne_results = zne_func(selected_noise_factors, observables_for_reg, sigma=sigma_for_reg)
+            else:
+                zne_results = zne_func(selected_noise_factors, observables_for_reg)
             zne_observables[inds] = zne_results.intercept
             if confidence is not None:
-                zne_observables_confidence[inds + (0,)] = zne_results.intercept - zne_results.std_err #review
-                zne_observables_confidence[inds + (1,)] = zne_results.intercept + zne_results.std_err #review
+                half = z_alpha * zne_results.std_err
+                zne_observables_confidence[inds + (0,)] = zne_results.intercept - half
+                zne_observables_confidence[inds + (1,)] = zne_results.intercept + half
 
     if guess:
         _say("Guess mode: fitting cal observables with intercept fixed at 1, "
@@ -1018,19 +1135,36 @@ def postprocessing_joana(executor_jobs, job_data, observables_genfuncs, postsele
             cal_for_reg = np.array(clean_cal_observables[zne_indices, *inds], dtype=float)
             sim_for_reg = np.array(clean_observables[zne_indices, *inds], dtype=float)
             if np.isnan(cal_for_reg).any() or np.isnan(sim_for_reg).any():
+                if confidence is not None:
+                    guessed_zne_observables_confidence[inds] = np.nan
                 continue
+            sim_sigma = None
+            if confidence is not None:
+                ci_for_reg = np.asarray(clean_observables_confidence[zne_indices, *inds, :], dtype=float)
+                sim_sigma = (ci_for_reg[..., 1] - ci_for_reg[..., 0]) / (2 * z_alpha)
+                if not np.all(np.isfinite(sim_sigma)) or np.any(sim_sigma <= 0):
+                    guessed_zne_observables_confidence[inds] = np.nan
+                    continue
             cal_params = cal_fitter(selected_noise_factors, np.abs(cal_for_reg))
             if any(not np.all(np.isfinite(np.atleast_1d(v))) for v in cal_params.values()):
                 n_failed_cal += 1
+                if confidence is not None:
+                    guessed_zne_observables_confidence[inds] = np.nan
                 continue
-            sim_result = sim_applier(selected_noise_factors, sim_for_reg, cal_params)
+            if confidence is not None:
+                sim_result = sim_applier(selected_noise_factors, sim_for_reg, cal_params, sigma=sim_sigma)
+            else:
+                sim_result = sim_applier(selected_noise_factors, sim_for_reg, cal_params)
             if not np.isfinite(sim_result.intercept):
                 n_failed_sim += 1
+                if confidence is not None:
+                    guessed_zne_observables_confidence[inds] = np.nan
                 continue
             guessed_zne_observables[inds] = sim_result.intercept
             if confidence is not None:
-                guessed_zne_observables_confidence[inds + (0,)] = sim_result.intercept - sim_result.std_err
-                guessed_zne_observables_confidence[inds + (1,)] = sim_result.intercept + sim_result.std_err
+                half = z_alpha * sim_result.std_err
+                guessed_zne_observables_confidence[inds + (0,)] = sim_result.intercept - half
+                guessed_zne_observables_confidence[inds + (1,)] = sim_result.intercept + half
         if n_failed_cal or n_failed_sim:
             _say(f"Guess mode: {n_failed_cal} cal fits failed, {n_failed_sim} sim refits failed")
         zne_observables = guessed_zne_observables

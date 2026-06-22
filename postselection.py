@@ -74,15 +74,14 @@ def gauge_recovery(samples_dict, postselection_ops, basis="Z", flip_threshold=No
             
     return recovered_samples_dict
 
-def gauge_recovery_and_measure_executor(executor_result, circuit, backend, postselection_ops, diagonal_observables, trex_scale_factors=None, postselection_strategy="edge", basis="Z", flip_threshold=None, flipped_syndromes=None, minimum_shots=None, register_name="meas", verbose=True, label=None, noise_factor_labels=None):
+def gauge_recovery_and_measure_executor(executor_result, circuit, backend, postselection_ops, diagonal_observables, trex_scale_factors=None, postselection_strategy="edge", basis="Z", flip_threshold=None, flipped_syndromes=None, minimum_shots=None, register_name="meas", verbose=True, label=None, noise_factor_labels=None, confidence=None, bootstrap_unit="pooled"):
 
     if trex_scale_factors is None:
         trex_scale_factors = np.ones(len(diagonal_observables))
 
+    # Non-markovian postselection
     raw_register = executor_result[register_name]
     correction_flips = executor_result[f"measurement_flips.{register_name}"]
-
-    # Non-markovian postselection
     post_selector = PostSelector.from_circuit(circuit, coupling_map=backend.coupling_map)
     non_markovian_mask = post_selector.compute_mask(executor_result, strategy=postselection_strategy)
 
@@ -116,26 +115,44 @@ def gauge_recovery_and_measure_executor(executor_result, circuit, backend, posts
     strings_expectation_values = (1 - 2*strings_expectation_values) * non_markovian_mask.reshape(-1, 1) * observables_phases
     strings_expectation_values = strings_expectation_values.reshape(*raw_register.shape[:-1], len(diagonal_observables))
 
-    # Filter by gauge-recovery flip count and accumulate per noise factor.
-    # raw_register.shape = (R, F, S, Q); we keep F as the noise-factor axis -> output (F, nobs).
+    # Determine the "kept" mask (NM ∩ flip-cutoff) once, BEFORE bootstrapping.
+    # Bootstrapping should resample shots with their original (deterministic) classification
+    # — we don't re-run MWPM per resample.
     unique_nflips = np.unique(npredicted_flips)
-    expectation_values = np.zeros((*raw_register.shape[1:-2], len(diagonal_observables)))
-    gauge_num_shots_kept = np.zeros(raw_register.shape[1:-2])
-    # Track which shots survived the gauge-flip cutoff (combined with NM mask) for verbose reporting
     gauge_kept_mask = np.zeros(raw_register.shape[:-1], dtype=bool)
+    # We need to mirror the original break logic: walk unique_nflips in order, accumulate kept
+    # shots, and stop once flip_threshold is exceeded (subject to minimum_shots).
+    running_num_kept = np.zeros(raw_register.shape[1:-2])
     for unflips in unique_nflips:
         if (flip_threshold is not None) and (unflips > flip_threshold):
-            if (minimum_shots is not None) and (gauge_num_shots_kept.min() > minimum_shots):
+            if (minimum_shots is not None) and (running_num_kept.min() > minimum_shots):
                 break
             elif minimum_shots is None:
                 break
         unflips_mask = np.equal(npredicted_flips, unflips)
-        # A shot contributes if it survived non-Markovian post-selection AND has this flip count.
         kept_this_nflips = non_markovian_mask & unflips_mask
         gauge_kept_mask |= kept_this_nflips
-        gauge_num_shots_kept += np.sum(kept_this_nflips, axis=(0, -1))
-        contributing = strings_expectation_values * unflips_mask[..., np.newaxis]
-        expectation_values += np.sum(contributing, axis=(0, -2))
+        running_num_kept += np.sum(kept_this_nflips, axis=(0, -1))
+
+    # Per-shot ±1/0 contribution: signed expectation if shot is kept, else 0.
+    # Note: strings_expectation_values is already zeroed for NM-rejected shots (multiplied by
+    # non_markovian_mask above); here we additionally zero shots that fail the flip cutoff.
+    per_shot_signed = strings_expectation_values * gauge_kept_mask[..., np.newaxis]
+
+    def aggregate(per_shot_tensor):
+        # Mirrors the original aggregation: sum signed contributions over (randomizations, shots),
+        # divide by the number of kept shots per noise factor, scale by TREX factors.
+        # Determine kept-count per noise factor from the tensor itself: a kept shot contributes ±1
+        # to every observable; use observable 0 as a survival indicator.
+        per_shot_kept = (per_shot_tensor[..., 0] != 0)         # (R, F, S)
+        nkept = np.sum(per_shot_kept, axis=(0, -1))            # (F,)
+        signed_sum = np.sum(per_shot_tensor, axis=(0, -2))     # (F, O)
+        safe = np.where(nkept > 0, nkept, 1)
+        out = signed_sum / safe[:, np.newaxis] * trex_scale_factors
+        out = np.where(nkept[:, np.newaxis] > 0, out, np.nan)
+        return out
+
+    expectation_values = aggregate(per_shot_signed)
 
     if verbose:
         # GSC correction rate: of NM-surviving shots, fraction where MWPM flipped at least one bit
@@ -150,12 +167,14 @@ def gauge_recovery_and_measure_executor(executor_result, circuit, backend, posts
             header_suffix="final retention (NM + GSC flip cutoff)",
         )
 
-    # NaN-safe divide for noise factors with zero kept shots
-    safe_kept = np.where(gauge_num_shots_kept > 0, gauge_num_shots_kept, 1)
-    expectation_values = expectation_values / safe_kept[:, np.newaxis] * trex_scale_factors
-    expectation_values = np.where(gauge_num_shots_kept[:, np.newaxis] > 0, expectation_values, np.nan)
+    if confidence is None:
+        return expectation_values
 
-    return expectation_values
+    from hardware.utils.bootstrap import bootstrap_per_shot_aggregate
+    confidence_intervals = bootstrap_per_shot_aggregate(
+        per_shot_signed, aggregate, confidence=confidence, bootstrap_unit=bootstrap_unit,
+    )
+    return expectation_values, confidence_intervals
 
 
 def gauge_recovery_executor(executor_result, postselection_ops,  flip_threshold=None, minimum_shots=None, flipped_syndromes=None, recovery_function=None, basis="Z", register_name="meas"):
