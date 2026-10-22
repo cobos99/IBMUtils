@@ -205,16 +205,42 @@ def many_measure_diagonal_observables(samples_dicts, diagonal_observables, confi
         expectation_values = np.array(result).reshape((*og_samples_dicts_shape, len(diagonal_observables)))
         return expectation_values
 
+def executor_unique_samples(executor_result, register_name="meas", shots_mask=None):
+    # Distinct bitstrings of an executor item result and their counts, after undoing the measurement twirling flips and merging
+    # all the randomizations. Column q of the bitstrings is the classical bit q (qubit q for measure_all), while the bitstrings of
+    # samples dicts have bit 0 last. shots_mask, broadcastable to the shape of the register without its last axis, selects shots
+    raw_register = executor_result[register_name]
+    flips_key = f"measurement_flips.{register_name}"
+    samples = raw_register ^ executor_result[flips_key] if flips_key in executor_result else raw_register
+    samples = samples.reshape(-1, raw_register.shape[-1])
+    if shots_mask is not None:
+        samples = samples[np.broadcast_to(shots_mask, raw_register.shape[:-1]).reshape(-1)]
+    if len(samples) == 0:
+        return np.zeros((0, raw_register.shape[-1]), dtype=np.uint8), np.zeros(0, dtype=np.int64)
+    strings, counts = np.unique(samples.astype(np.uint8), axis=0, return_counts=True)
+    return strings, counts
+
 def measure_observables_executor(executor_result, diagonal_observables, basis="Z", confidence=None, register_name="meas"):
     # Executor result shape:
     # (p_randomizations, ...custom..., parameters, shots, nregisters)
     # Final shape
     # (...custom..., nobservables)
-    if confidence is not None:
-        raise NotImplementedError("Confidence intervals are not implemented yet.")
-    
+    # The observables are applied as written, with label position q acting on qubit q (measure_observables applies them as Pauli
+    # objects, with label position q acting on qubit n-1-q). With confidence, it also returns bootstrap confidence intervals
+    # computed as in measure_observables
     if isinstance(diagonal_observables, Pauli):
         diagonal_observables = [diagonal_observables]
+    if confidence is not None:
+        strings, counts = executor_unique_samples(executor_result, register_name)
+        observables_mask = np.array([[int(str(opel) == basis) for opel in invert_pauli_order(observable)] for observable in diagonal_observables])
+        observables_phases = np.array([1j**obs.phase for obs in diagonal_observables])
+        if np.any(observables_phases.imag != 0):
+            raise ValueError("Diagonal observables must have +-1 phases")
+        strings_expectation_values = (1 - 2*((strings @ observables_mask.T) % 2)) * observables_phases.real
+        expectation_values = counts @ strings_expectation_values / np.sum(counts)
+        # bootstrap_sample_dict_mean only uses the counts of the samples dict
+        confidence_intervals = bootstrap_sample_dict_mean(dict(enumerate(counts)), strings_expectation_values, confidence)
+        return expectation_values, confidence_intervals
     raw_register = executor_result[register_name]
     correction_flips = executor_result[f"measurement_flips.{register_name}"]
     corrected_samples = (raw_register ^ correction_flips).reshape((-1, raw_register.shape[-1]))
@@ -229,7 +255,8 @@ def measure_observables_executor(executor_result, diagonal_observables, basis="Z
     strings_expectation_values = 1 - 2*strings_expectation_values
     strings_expectation_values = strings_expectation_values * observables_phases
     strings_expectation_values = strings_expectation_values.reshape((*raw_register.shape[:-1], len(diagonal_observables)))
-    expectation_values = np.mean(strings_expectation_values, axis=(0, -2))
+    mean_axes = tuple(range(len(strings_expectation_values.shape)-1))
+    expectation_values = np.mean(strings_expectation_values, axis=mean_axes)
     return expectation_values
 
 def measure_observables_postselection(executor_result, circuit, backend, diagonal_observables, trex_scale_factors=None, postselection_strategy="edge", basis="Z", register_name="meas"):
@@ -263,7 +290,7 @@ def many_measure_observables_executor(executor_results, diagonal_observables, ba
     if confidence is not None:
         raise NotImplementedError("Confidence intervals are not implemented yet.")
     nqubits = len(diagonal_observables[0])
-    executor_results = np.array(executor_results)
+    executor_results = np.array(executor_results, dtype=object)
     for observable in diagonal_observables:
         if len(observable) != nqubits:
             raise ValueError("All observables must act on the same number of qubits")
@@ -280,7 +307,7 @@ def many_measure_observables_executor(executor_results, diagonal_observables, ba
         result = pool.starmap(threadsafe_samples_transfer, measure_args)
     shmem.close()
     shmem.unlink()
-    expectation_values = np.array(result, dtype=object).reshape((*og_results_shape, *result[0].shape))
+    expectation_values = np.array(result).reshape((len(executor_results), result[0].shape[-1]))
     return expectation_values
     
 # -----------------------------------------

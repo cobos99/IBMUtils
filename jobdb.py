@@ -1,5 +1,5 @@
 from qiskit_ibm_runtime.exceptions import RuntimeJobFailureError, RuntimeInvalidStateError
-from qiskit_ibm_runtime.quantum_program.quantum_program_result import QuantumProgramResult
+from qiskit_ibm_runtime.results import QuantumProgramResult
 from qiskit_ibm_runtime import RuntimeDecoder, RuntimeEncoder
 from utils.samples import group_multirep_samples_dicts
 import utils.execution as execution
@@ -102,14 +102,15 @@ class ExecDB:
         return data_to_add
     
     def add(self, batch_args, ran_circuits, observable_generating_func_name, job_ids_arr):
+        self.reload()
         thisid = 0 if len(self._data) == 0 else self._data[-1]["id"] + 1
         data_to_add = {"id": thisid}
         data_to_add = data_to_add | self.generate_batch_db_data(batch_args, ran_circuits, observable_generating_func_name, job_ids_arr)
-        self.reload()
         self._data.append(data_to_add)
         self.save()
 
     def add_data(self, data):
+        self.reload()
         thisid = 0 if len(self._data) == 0 else self._data[-1]["id"] + 1
         data_contains_id = data.get("id", False)
         if data_contains_id:
@@ -130,8 +131,8 @@ class ExecDB:
         jobs = execution.execute_sampler_batch(backend, sampler_opt_dict, job_circuits, cal_circuits, repeat_cal, db_options, self, share_total_shots, max_shots)
         return jobs
 
-    def execute_sampler_batch_choosing_layout(self, backend, sampler_opt_dict, job_log_circuits, cal_log_circuits=None, repeat_cal=False, db_options=None, share_total_shots=False, optimization_level=3, max_shots=75000):
-        jobs = execution.execute_sampler_batch_choosing_layout(backend, sampler_opt_dict, job_log_circuits, cal_log_circuits, repeat_cal, db_options, self, share_total_shots, optimization_level, max_shots)
+    def execute_sampler_batch_choosing_layout(self, backend, service, sampler_opt_dict, job_log_circuits, cal_log_circuits=None, repeat_cal=False, db_options=None, share_total_shots=False, optimization_level=3, max_shots=75000):
+        jobs = execution.execute_sampler_batch_choosing_layout(backend, service, sampler_opt_dict, job_log_circuits, cal_log_circuits, repeat_cal, db_options, self, share_total_shots, optimization_level, max_shots)
         return jobs
 
     def execute_sampler_batch_choosing_layout_by_batches(self, backend, sampler_opt_dict, job_log_circuits, batches_first_index, cal_log_circuits=None, jobcal_together=False, db_options=None, optimization_level=0):
@@ -171,26 +172,63 @@ class ExecDB:
             raise ValueError(f"No batch found with the provided parameters")
         jobs_ids = [job["job_id"] for job in jobs_data["jobs"]]
         jobs_results = load_results_from_local_or_ibmq(jobs_ids, ibmq_service, jobs_result_folder, verbose=verbose)
-        # jobs_samples = [samples_from_result(job_result) for job_result in jobs_results]
-        jobs_samples = []
-        for job_result in jobs_results:
-            jobs_samples += samples_from_result(job_result)
-        jobs_samples = np.array(jobs_samples, dtype=object)
         jobs_shape = jobs_data["job_circuits_shape"]
         cal_shape = jobs_data["cal_circuits_shape"]
-        nrepetitions = jobs_data["nrepetitions"]
-        repeat_cal = jobs_data["repeat_cal"]
+        nrepetitions = jobs_data.get("nrepetitions", 1)
+        repeat_cal = jobs_data.get("repeat_cal", False)
+        if any(isinstance(job_result, QuantumProgramResult) for job_result in jobs_results):
+            # Executor jobs with a single item each. The item results (registers and measurement flips arrays) are returned as they
+            # are, with shapes job_circuits_shape and cal_circuits_shape, and None for failed jobs
+            if nrepetitions != 1:
+                raise NotImplementedError("Executor batches with repetitions are not supported")
+            if any(job_result is not None and len(job_result) != 1 for job_result in jobs_results):
+                raise NotImplementedError("Only executor jobs with a single item are supported")
+            items = np.empty(len(jobs_results), dtype=object)
+            for i, job_result in enumerate(jobs_results):
+                items[i] = job_result[0] if job_result is not None else None
+            if cal_shape is None:
+                to_return = [items.reshape(jobs_shape)]
+            else:
+                if jobs_shape == cal_shape: # Interleaved as [cal, job, cal, job, ...]
+                    cal_items, job_items = items[0::2], items[1::2]
+                else: # All the calibration jobs first
+                    cal_items, job_items = items[:np.prod(cal_shape)], items[np.prod(cal_shape):]
+                to_return = [job_items.reshape(jobs_shape), cal_items.reshape(cal_shape)]
+            if return_data:
+                to_return.append(jobs_data)
+            return to_return
+        # The PUBs of all the jobs are the circuits of the batch in order, unless there is one job per circuit and every job
+        # runs several PUBs (e.g. the gauge twirling randomizations of z2hm_tdepsb_gaugetwirling_submit.py). Then the PUBs
+        # of each job are kept together and the samples come with an extra last axis of length the number of PUBs per job.
+        jobs_pubs_samples = [samples_from_result(job_result) for job_result in jobs_results]
+        ncircuits = np.prod(jobs_shape)*nrepetitions + (np.prod(cal_shape)*(nrepetitions if repeat_cal else 1) if cal_shape is not None else 0)
+        npubs = {len(pubs_samples) for pubs_samples, job_result in zip(jobs_pubs_samples, jobs_results) if job_result is not None}
+        pubs_shape = ()
+        if sum(len(pubs_samples) for pubs_samples in jobs_pubs_samples) != ncircuits and len(jobs_pubs_samples) == ncircuits and len(npubs) == 1:
+            if cal_shape is not None and jobs_shape != cal_shape:
+                raise NotImplementedError("Jobs with several PUBs are only supported with equal job_circuits_shape and cal_circuits_shape")
+            pubs_shape = (npubs.pop(),)
+            # The PUBs axis goes first since group_multirep_samples_dicts groups along the last axis, failed jobs get empty samples dicts
+            jobs_samples = np.empty((*pubs_shape, len(jobs_pubs_samples)), dtype=object)
+            for i, (pubs_samples, job_result) in enumerate(zip(jobs_pubs_samples, jobs_results)):
+                jobs_samples[:, i] = pubs_samples if job_result is not None else [{} for _ in range(pubs_shape[0])]
+        else:
+            jobs_samples = np.array([samples_dict for pubs_samples in jobs_pubs_samples for samples_dict in pubs_samples], dtype=object)
         if cal_shape is None:
-            multirep_combined_job_samples = group_multirep_samples_dicts(jobs_samples, jobs_shape, nrepetitions, cal=False)
+            multirep_combined_job_samples = group_multirep_samples_dicts(jobs_samples, (*pubs_shape, *jobs_shape), nrepetitions, cal=False)
         else:
             if jobs_shape == cal_shape:
-                multirep_combined_job_samples, multirep_combined_cal_samples = group_multirep_samples_dicts(jobs_samples, jobs_shape, nrepetitions, cal=True, repeat_cal=repeat_cal)
+                multirep_combined_job_samples, multirep_combined_cal_samples = group_multirep_samples_dicts(jobs_samples, (*pubs_shape, *jobs_shape), nrepetitions, cal=True, repeat_cal=repeat_cal)
             else:
                 cal_nrepetitions = nrepetitions if repeat_cal else 1
                 cal_samples = jobs_samples[:np.prod(cal_shape)*cal_nrepetitions].reshape(cal_shape[0]*cal_nrepetitions, cal_shape[1])
                 jobs_samples = jobs_samples[np.prod(cal_shape)*cal_nrepetitions:].reshape(jobs_shape[0]*nrepetitions, jobs_shape[1])
                 multirep_combined_job_samples = group_multirep_samples_dicts(jobs_samples, jobs_shape, nrepetitions, cal=False)
                 multirep_combined_cal_samples = group_multirep_samples_dicts(cal_samples, cal_shape, cal_nrepetitions, cal=False)
+        if pubs_shape:
+            multirep_combined_job_samples = np.moveaxis(multirep_combined_job_samples, 0, -1)
+            if cal_shape is not None:
+                multirep_combined_cal_samples = np.moveaxis(multirep_combined_cal_samples, 0, -1)
         to_return = [multirep_combined_job_samples]
         if cal_shape is not None:
             to_return.append(multirep_combined_cal_samples)
@@ -218,18 +256,38 @@ def load_job_result(filepath):
 
 def save_job_result(filepath, job):
     result = job.result()
-    with open(filepath, "w") as f:
-        json.dump(result, f, cls=RuntimeEncoder)
+    if isinstance(result, QuantumProgramResult):
+        # Executor results are not JSON serializable, their arrays are saved in a compressed npz file next to filepath
+        save_quantum_program_result(os.path.splitext(filepath)[0] + ".npz", result)
+    else:
+        with open(filepath, "w") as f:
+            json.dump(result, f, cls=RuntimeEncoder)
     return result
-    
+
+def save_quantum_program_result(filepath, result):
+    # Only the arrays of the items are saved, as "<item index>/<key>", not the metadata
+    arrays = {f"{i}/{key}": np.asarray(value) for i, item in enumerate(result) for key, value in item.items()}
+    np.savez_compressed(filepath, **arrays)
+
+def load_quantum_program_result(filepath):
+    items = {}
+    with np.load(filepath) as npz:
+        for name in npz.files:
+            item_index, key = name.split("/", 1)
+            items.setdefault(int(item_index), {})[key] = npz[name]
+    return QuantumProgramResult([items[i] for i in sorted(items)])
+
 def load_results_from_local_or_ibmq(job_ids, ibmq_service, jobs_result_folder="", verbose=False):
     job_results = []
     for job_id in job_ids:
         if verbose: print(f"\rLoading job {job_id}...".ljust(100), end="")
         if os.path.isdir(jobs_result_folder):
             job_filepath = os.path.join(jobs_result_folder, f"{job_id}.json")
+            executor_job_filepath = os.path.join(jobs_result_folder, f"{job_id}.npz")
             if os.path.isfile(job_filepath):
                 job_result = load_job_result(job_filepath)
+            elif os.path.isfile(executor_job_filepath):
+                job_result = load_quantum_program_result(executor_job_filepath)
             else:
                 job_obj = ibmq_service.job(job_id=job_id)
                 try:

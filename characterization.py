@@ -1,7 +1,5 @@
 from __future__ import annotations
-import networkx as nx
-import seaborn as sns
-from qiskit_ibm_runtime.ibm_backend import Backend
+
 import re
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 import copy
@@ -10,22 +8,18 @@ import matplotlib.pyplot as plt
 import rustworkx as rx
 from qiskit_ibm_runtime.ibm_backend import IBMBackend
 from pandas import DataFrame
-import networkx as nx
-from qiskit_experiments.library import T1, T2Hahn
-from qiskit_experiments.framework import BatchExperiment, ParallelExperiment
 
 from qiskit import QuantumCircuit
 from qiskit.result import marginal_counts as mcts
-from datetime import datetime
 
 from qiskit_ibm_runtime import SamplerV2 as Sampler
 from qiskit_ibm_runtime.models import BackendProperties
 
+from qiskit_ibm_runtime import QiskitRuntimeService
+from qiskit_experiments.framework import ExperimentData
 from qiskit_experiments.framework import BatchExperiment, ParallelExperiment
 from qiskit_experiments.library import StandardRB
 from qiskit_experiments.library.randomized_benchmarking import LayerFidelity
-from tomlkit import date
-
 
 # ---------------------- Helper functions (module-level) ---------------------- #
 def _build_readout_circuits(num_qubits: int) -> List[QuantumCircuit]:
@@ -83,9 +77,7 @@ def _build_oneq_rb_experiments(
                     num_samples=num_samples,
                 )
             )
-        sqrb_exp_list.append(
-            ParallelExperiment(rb1q_exps, backend=backend, flatten_results=True)
-        )
+        sqrb_exp_list.append(ParallelExperiment(rb1q_exps, backend=backend, flatten_results=True))
 
     sqrb_exp = BatchExperiment(sqrb_exp_list, backend=backend, flatten_results=True)
     sqrb_exp.set_experiment_options(separate_jobs=True)
@@ -115,9 +107,7 @@ def _build_layered_rb_experiments(
         all_pairs = _path_to_edges(grid_chains[i], coupling_map)
         for j, pair_lst in enumerate(all_pairs):
             grid_chain_flt[i] += grid_chains[i][j]
-            sub_pairs = [
-                tuple(p) if tuple(p) in edges else tuple(p)[::-1] for p in pair_lst
-            ]
+            sub_pairs = [tuple(p) if tuple(p) in edges else tuple(p)[::-1] for p in pair_lst]
             layers[2 * i] += sub_pairs[0::2]
             layers[2 * i + 1] += sub_pairs[1::2]
 
@@ -159,19 +149,13 @@ def _get_readout_errors(num_qubits: int, readout_result) -> Dict[int, float]:
     spam_shots = readout_result[0].data.meas.num_shots
     for q in range(num_qubits):
         try:
-            ro_error[q] = (
-                1
-                - ((mcts(cts_spam0, [q])["0"] + mcts(cts_spam1, [q])["1"]) / 2)
-                / spam_shots
-            )
+            ro_error[q] = 1 - ((mcts(cts_spam0, [q])["0"] + mcts(cts_spam1, [q])["1"]) / 2) / spam_shots
         except KeyError:
             ro_error[q] = 1 - (mcts(cts_spam0, [q])["0"] / 2) / spam_shots
     return ro_error
 
 
-def _get_oneq_errors(
-    job_results_df: DataFrame,
-) -> Dict[Union[int, Tuple[int, int]], float]:
+def _get_oneq_errors(job_results_df: DataFrame) -> Dict[Union[int, Tuple[int, int]], float]:
     """Map qiskit-experiments analysis DataFrame to {component: value} (1q EPG)."""
     values_map: Dict[Union[int, Tuple[int, int]], float] = {}
     for _, row in job_results_df.iterrows():
@@ -185,12 +169,7 @@ def _get_oneq_errors(
     return values_map
 
 
-def _get_twoq_errors(
-    backend: IBMBackend,
-    lf_result_h_df: DataFrame,
-    lf_result_v_df: DataFrame,
-    layers: List[List[Tuple[int, int]]],
-) -> Dict[str, float]:
+def _get_twoq_errors(backend: IBMBackend, lf_result_h_df: DataFrame, lf_result_v_df: DataFrame, layers: List[List[Tuple[int, int]]]) -> Dict[str, float]:
     """Combine LF H/V DataFrames into a pair->error map using project utilities."""
     twoq_gate = _select_twoq_gate(backend)
     lf_err_dict = _make_error_dict(backend, twoq_gate)
@@ -202,21 +181,6 @@ def _get_twoq_errors(
 
     lf_err_dict = _update_error_dict(lf_err_dict, updated_err_dicts)
     return lf_err_dict
-
-
-def _update_coherence_props(props: Dict, error_map: Dict[int, float]) -> Dict:
-    """Patch per-qubit T1, T2 values."""
-    refreshed_props = copy.deepcopy(props)
-
-    qubits = list(error_map.keys())
-    for i in range(len(qubits)):
-        for param in refreshed_props["qubits"][i]:
-            if param["name"] == "T1":
-                param["value"] = error_map[i]["T1"]
-            if param["name"] == "T2":
-                param["value"] = error_map[i]["T2"]
-                break
-    return refreshed_props
 
 
 def _update_readout_props(props: Dict, error_map: Dict[int, float]) -> Dict:
@@ -237,12 +201,16 @@ def _update_1q_props(
     for ix, gate in enumerate(props["gates"]):
         if len(gate["qubits"]) > 1:
             x = re.search(r"^([a-zA-Z]+)([0-9]+_[0-9]+)", gate["name"])
+            if x is None:
+                continue
             gate_type, component = x[1], (
                 int(x[2].split("_")[0]),
                 int(x[2].split("_")[1]),
             )
         else:
             x = re.search(r"^([a-zA-Z]+)([0-9]+)", gate["name"])
+            if x is None:
+                continue
             gate_type, component = x[1], int(x[2])
 
         if gate_type in ("sx", "x"):
@@ -265,9 +233,7 @@ def _update_lf_props(props: Dict, error_map: Dict[str, float]) -> Dict:
                 gate_error = error_map.get(pair_key, error_map.get(pair_key_rev))
                 for iy, param in enumerate(gate["parameters"]):
                     if param["name"] == "gate_error":
-                        props["gates"][ix]["parameters"][iy]["value"] = float(
-                            gate_error
-                        )
+                        props["gates"][ix]["parameters"][iy]["value"] = float(gate_error)
                         break
     return props
 
@@ -362,7 +328,6 @@ def _make_error_dict(backend: IBMBackend, two_q_gate: str, keep_perm: bool = Fal
 
     return err_dict
 
-
 def _df_to_error_dict(lf_df: DataFrame, gate_list: list):
     """Take in the dataframe from the layer fidelity experiment
     and convert it to a dictionary of gate errors
@@ -384,7 +349,6 @@ def _df_to_error_dict(lf_df: DataFrame, gate_list: list):
         err_rb_dict["%d_%d" % (gate[0], gate[1])] = 4 / 5 * (1 - gate_pf)
 
     return err_rb_dict
-
 
 def _update_error_dict(
     error_dict: dict,
@@ -419,7 +383,6 @@ def _update_error_dict(
 
     return error_dict
 
-
 def _get_grids(
     backend: IBMBackend,
 ):
@@ -437,792 +400,50 @@ def _get_grids(
     grid_chains = []
 
     if backend.num_qubits == 127:
-        horz_chain = [
-            [
-                13,
-                12,
-                11,
-                10,
-                9,
-                8,
-                7,
-                6,
-                5,
-                4,
-                3,
-                2,
-                1,
-                0,
-                14,
-                18,
-                19,
-                20,
-                21,
-                22,
-                23,
-                24,
-                25,
-                26,
-                27,
-                28,
-                29,
-                30,
-                31,
-                32,
-                36,
-                51,
-                50,
-                49,
-                48,
-                47,
-                46,
-                45,
-                44,
-                43,
-                42,
-                41,
-                40,
-                39,
-                38,
-                37,
-                52,
-                56,
-                57,
-                58,
-                59,
-                60,
-                61,
-                62,
-                63,
-                64,
-                65,
-                66,
-                67,
-                68,
-                69,
-                70,
-                74,
-                89,
-                88,
-                87,
-                86,
-                85,
-                84,
-                83,
-                82,
-                81,
-                80,
-                79,
-                78,
-                77,
-                76,
-                75,
-                90,
-                94,
-                95,
-                96,
-                97,
-                98,
-                99,
-                100,
-                101,
-                102,
-                103,
-                104,
-                105,
-                106,
-                107,
-                108,
-                112,
-                126,
-                125,
-                124,
-                123,
-                122,
-                121,
-                120,
-                119,
-                118,
-                117,
-                116,
-                115,
-                114,
-                113,
-            ]
-        ]
-        vert_chain = [
-            [
-                113,
-                114,
-                109,
-                96,
-                95,
-                94,
-                90,
-                75,
-                76,
-                77,
-                71,
-                58,
-                57,
-                56,
-                52,
-                37,
-                38,
-                39,
-                33,
-                20,
-                19,
-                18,
-                14,
-                0,
-                1,
-                2,
-                3,
-                4,
-                15,
-                22,
-                23,
-                24,
-                34,
-                43,
-                42,
-                41,
-                53,
-                60,
-                61,
-                62,
-                72,
-                81,
-                80,
-                79,
-                91,
-                98,
-                99,
-                100,
-                110,
-                118,
-                119,
-                120,
-                121,
-                122,
-                111,
-                104,
-                103,
-                102,
-                92,
-                83,
-                84,
-                85,
-                73,
-                66,
-                65,
-                64,
-                54,
-                45,
-                46,
-                47,
-                35,
-                28,
-                27,
-                26,
-                16,
-                8,
-                9,
-                10,
-                11,
-                12,
-                17,
-                30,
-                31,
-                32,
-                36,
-                51,
-                50,
-                49,
-                55,
-                68,
-                69,
-                70,
-                74,
-                89,
-                88,
-                87,
-                93,
-                106,
-                107,
-                108,
-                112,
-                126,
-            ]
-        ]
+        horz_chain = [[13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 14, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 36, 51, 50, 49, 48, 47, 46, 45, 44, 43, 42, 41, 40, 39, 38, 37, 52, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 74, 89, 88, 87, 86, 85, 84, 83, 82, 81, 80, 79, 78, 77, 76, 75, 90, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 112, 126, 125, 124, 123, 122, 121, 120, 119, 118, 117, 116, 115, 114, 113]]
+        vert_chain = [[113, 114, 109, 96, 95, 94, 90, 75, 76, 77, 71, 58, 57, 56, 52, 37, 38, 39, 33, 20, 19, 18, 14, 0, 1, 2, 3, 4, 15, 22, 23, 24, 34, 43, 42, 41, 53, 60, 61, 62, 72, 81, 80, 79, 91, 98, 99, 100, 110, 118, 119, 120, 121, 122, 111, 104, 103, 102, 92, 83, 84, 85, 73, 66, 65, 64, 54, 45, 46, 47, 35, 28, 27, 26, 16, 8, 9, 10, 11, 12, 17, 30, 31, 32, 36, 51, 50, 49, 55, 68, 69, 70, 74, 89, 88, 87, 93, 106, 107, 108, 112, 126]]
     elif backend.num_qubits == 133:
-        horz_chain = [
-            [
-                14,
-                13,
-                12,
-                11,
-                10,
-                9,
-                8,
-                7,
-                6,
-                5,
-                4,
-                3,
-                2,
-                1,
-                0,
-                15,
-                19,
-                20,
-                21,
-                22,
-                23,
-                24,
-                25,
-                26,
-                27,
-                28,
-                29,
-                30,
-                31,
-                32,
-                33,
-                37,
-                52,
-                51,
-                50,
-                49,
-                48,
-                47,
-                46,
-                45,
-                44,
-                43,
-                42,
-                41,
-                40,
-                39,
-                38,
-                53,
-                57,
-                58,
-                59,
-                60,
-                61,
-                62,
-                63,
-                64,
-                65,
-                66,
-                67,
-                68,
-                69,
-                70,
-                71,
-                75,
-                90,
-                89,
-                88,
-                87,
-                86,
-                85,
-                84,
-                83,
-                82,
-                81,
-                80,
-                79,
-                78,
-                77,
-                76,
-                91,
-                95,
-                96,
-                97,
-                98,
-                99,
-                100,
-                101,
-                102,
-                103,
-                104,
-                105,
-                106,
-                107,
-                108,
-                109,
-                113,
-                128,
-                127,
-                126,
-                125,
-                124,
-                123,
-                122,
-                121,
-                120,
-                119,
-                118,
-                117,
-                116,
-                115,
-                114,
-                129,
-            ]
-        ]
-        vert_chain = [
-            [
-                129,
-                114,
-                115,
-                116,
-                110,
-                97,
-                96,
-                95,
-                91,
-                76,
-                77,
-                78,
-                72,
-                59,
-                58,
-                57,
-                53,
-                38,
-                39,
-                40,
-                34,
-                21,
-                20,
-                19,
-                15,
-                0,
-                1,
-                2,
-                3,
-                4,
-                16,
-                23,
-                24,
-                25,
-                35,
-                44,
-                43,
-                42,
-                54,
-                61,
-                62,
-                63,
-                73,
-                82,
-                81,
-                80,
-                92,
-                99,
-                100,
-                101,
-                111,
-                120,
-                119,
-                118,
-                130,
-            ],
-            [
-                131,
-                122,
-                123,
-                124,
-                112,
-                105,
-                104,
-                103,
-                93,
-                84,
-                85,
-                86,
-                74,
-                67,
-                66,
-                65,
-                55,
-                46,
-                47,
-                48,
-                36,
-                29,
-                28,
-                27,
-                17,
-                8,
-                9,
-                10,
-                11,
-                12,
-                18,
-                31,
-                32,
-                33,
-                37,
-                52,
-                51,
-                50,
-                56,
-                69,
-                70,
-                71,
-                75,
-                90,
-                89,
-                88,
-                94,
-                107,
-                108,
-                109,
-                113,
-                128,
-                127,
-                126,
-                132,
-            ],
-        ]
+        horz_chain = [[14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 37, 52, 51, 50, 49, 48, 47, 46, 45, 44, 43, 42, 41, 40, 39, 38, 53, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 75, 90, 89, 88, 87, 86, 85, 84, 83, 82, 81, 80, 79, 78, 77, 76, 91, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 113, 128, 127, 126, 125, 124, 123, 122, 121, 120, 119, 118, 117, 116, 115, 114, 129]]
+        vert_chain = [[129, 114, 115, 116, 110, 97, 96, 95, 91, 76, 77, 78, 72, 59, 58, 57, 53, 38, 39, 40, 34, 21, 20, 19, 15, 0, 1, 2, 3, 4, 16, 23, 24, 25, 35, 44, 43, 42, 54, 61, 62, 63, 73, 82, 81, 80, 92, 99, 100, 101, 111, 120, 119, 118, 130],
+                      [131, 122, 123, 124, 112, 105, 104, 103, 93, 84, 85, 86, 74, 67, 66, 65, 55, 46, 47, 48, 36, 29, 28, 27, 17, 8, 9, 10, 11, 12, 18, 31, 32, 33, 37, 52, 51, 50, 56, 69, 70, 71, 75, 90, 89, 88, 94, 107, 108, 109, 113, 128, 127, 126, 132]]
     elif backend.num_qubits == 156:
-        horz_chain = [
-            [
-                0,
-                1,
-                2,
-                3,
-                4,
-                5,
-                6,
-                7,
-                8,
-                9,
-                10,
-                11,
-                12,
-                13,
-                14,
-                15,
-                19,
-                35,
-                34,
-                33,
-                32,
-                31,
-                30,
-                29,
-                28,
-                27,
-                26,
-                25,
-                24,
-                23,
-                22,
-                21,
-                20,
-            ],
-            [
-                40,
-                41,
-                42,
-                43,
-                44,
-                45,
-                46,
-                47,
-                48,
-                49,
-                50,
-                51,
-                52,
-                53,
-                54,
-                55,
-                59,
-                75,
-                74,
-                73,
-                72,
-                71,
-                70,
-                69,
-                68,
-                67,
-                66,
-                65,
-                64,
-                63,
-                62,
-                61,
-                60,
-            ],
-            [
-                80,
-                81,
-                82,
-                83,
-                84,
-                85,
-                86,
-                87,
-                88,
-                89,
-                90,
-                91,
-                92,
-                93,
-                94,
-                95,
-                99,
-                115,
-                114,
-                113,
-                112,
-                111,
-                110,
-                109,
-                108,
-                107,
-                106,
-                105,
-                104,
-                103,
-                102,
-                101,
-                100,
-            ],
-            [
-                120,
-                121,
-                122,
-                123,
-                124,
-                125,
-                126,
-                127,
-                128,
-                129,
-                130,
-                131,
-                132,
-                133,
-                134,
-                135,
-                139,
-                155,
-                154,
-                153,
-                152,
-                151,
-                150,
-                149,
-                148,
-                147,
-                146,
-                145,
-                144,
-                143,
-                142,
-                141,
-                140,
-            ],
-        ]
-        vert_chain = [
-            [
-                0,
-                1,
-                2,
-                3,
-                16,
-                23,
-                22,
-                21,
-                36,
-                41,
-                42,
-                43,
-                56,
-                63,
-                62,
-                61,
-                76,
-                81,
-                82,
-                83,
-                96,
-                103,
-                102,
-                101,
-                116,
-                121,
-                122,
-                123,
-                136,
-                143,
-                142,
-                141,
-                140,
-            ],
-            [
-                5,
-                6,
-                7,
-                17,
-                27,
-                26,
-                25,
-                37,
-                45,
-                46,
-                47,
-                57,
-                67,
-                66,
-                65,
-                77,
-                85,
-                86,
-                87,
-                97,
-                107,
-                106,
-                105,
-                117,
-                125,
-                126,
-                127,
-                137,
-                147,
-                146,
-                145,
-            ],
-            [
-                9,
-                10,
-                11,
-                18,
-                31,
-                30,
-                29,
-                38,
-                49,
-                50,
-                51,
-                58,
-                71,
-                70,
-                69,
-                78,
-                89,
-                90,
-                91,
-                98,
-                111,
-                110,
-                109,
-                118,
-                129,
-                130,
-                131,
-                138,
-                151,
-                150,
-                149,
-            ],
-            [
-                13,
-                14,
-                15,
-                19,
-                35,
-                34,
-                33,
-                39,
-                53,
-                54,
-                55,
-                59,
-                75,
-                74,
-                73,
-                79,
-                93,
-                94,
-                95,
-                99,
-                115,
-                114,
-                113,
-                119,
-                133,
-                134,
-                135,
-                139,
-                155,
-                154,
-                153,
-            ],
-        ]
+        horz_chain = [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 35, 34, 33, 32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20],
+                      [40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 59, 75, 74, 73, 72, 71, 70, 69, 68, 67, 66, 65, 64, 63, 62, 61, 60],
+                      [80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 99, 115, 114, 113, 112, 111, 110, 109, 108, 107, 106, 105, 104, 103, 102, 101, 100],
+                      [120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 139, 155, 154, 153, 152, 151, 150, 149, 148, 147, 146, 145, 144, 143, 142, 141, 140]]
+        vert_chain = [[0, 1, 2, 3, 16, 23, 22, 21, 36, 41, 42, 43, 56, 63, 62, 61, 76, 81, 82, 83, 96, 103, 102, 101, 116, 121, 122, 123, 136, 143, 142, 141, 140],
+                      [5, 6, 7, 17, 27, 26, 25, 37, 45, 46, 47, 57, 67, 66, 65, 77, 85, 86, 87, 97, 107, 106, 105, 117, 125, 126, 127, 137, 147, 146, 145],
+                      [9, 10, 11, 18, 31, 30, 29, 38, 49, 50, 51, 58, 71, 70, 69, 78, 89, 90, 91, 98, 111, 110, 109, 118, 129, 130, 131, 138, 151, 150, 149],
+                      [13, 14, 15, 19, 35, 34, 33, 39, 53, 54, 55, 59, 75, 74, 73, 79, 93, 94, 95, 99, 115, 114, 113, 119, 133, 134, 135, 139, 155, 154, 153]]
     elif backend.num_qubits == 120:
-        horz_chain = [
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
-            [10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-            [20, 21, 22, 23, 24, 25, 26, 27, 28, 29],
-            [30, 31, 32, 33, 34, 35, 36, 37, 38, 39],
-            [40, 41, 42, 43, 44, 45, 46, 47, 48, 49],
-            [50, 51, 52, 53, 54, 55, 56, 57, 58, 59],
-            [60, 61, 62, 63, 64, 65, 66, 67, 68, 69],
-            [70, 71, 72, 73, 74, 75, 76, 77, 78, 79],
-            [80, 81, 82, 83, 84, 85, 86, 87, 88, 89],
-            [90, 91, 92, 93, 94, 95, 96, 97, 98, 99],
-            [100, 101, 102, 103, 104, 105, 106, 107, 108, 109],
-            [110, 111, 112, 113, 114, 115, 116, 117, 118, 119],
-        ]
-        vert_chain = [
-            [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110],
-            [1, 11, 21, 31, 41, 51, 61, 71, 81, 91, 101, 111],
-            [2, 12, 22, 32, 42, 52, 62, 72, 82, 92, 102, 112],
-            [3, 13, 23, 33, 43, 53, 63, 73, 83, 93, 103, 113],
-            [4, 14, 24, 34, 44, 54, 64, 74, 84, 94, 104, 114],
-            [5, 15, 25, 35, 45, 55, 65, 75, 85, 95, 105, 115],
-            [6, 16, 26, 36, 46, 56, 66, 76, 86, 96, 106, 116],
-            [7, 17, 27, 37, 47, 57, 67, 77, 87, 97, 107, 117],
-            [8, 18, 28, 38, 48, 58, 68, 78, 88, 98, 108, 118],
-            [9, 19, 29, 39, 49, 59, 69, 79, 89, 99, 109, 119],
-        ]
+        horz_chain = [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], [10, 11, 12, 13, 14, 15, 16, 17, 18, 19], [20, 21, 22, 23, 24, 25, 26, 27, 28, 29], [30, 31, 32, 33, 34, 35, 36, 37, 38, 39], [40, 41, 42, 43, 44, 45, 46, 47, 48, 49], [50, 51, 52, 53, 54, 55, 56, 57, 58, 59], [60, 61, 62, 63, 64, 65, 66, 67, 68, 69], [70, 71, 72, 73, 74, 75, 76, 77, 78, 79], [80, 81, 82, 83, 84, 85, 86, 87, 88, 89], [90, 91, 92, 93, 94, 95, 96, 97, 98, 99], [100, 101, 102, 103, 104, 105, 106, 107, 108, 109], [110, 111, 112, 113, 114, 115, 116, 117, 118, 119]]
+        vert_chain = [[0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110], [1, 11, 21, 31, 41, 51, 61, 71, 81, 91, 101, 111], [2, 12, 22, 32, 42, 52, 62, 72, 82, 92, 102, 112], [3, 13, 23, 33, 43, 53, 63, 73, 83, 93, 103, 113], [4, 14, 24, 34, 44, 54, 64, 74, 84, 94, 104, 114], [5, 15, 25, 35, 45, 55, 65, 75, 85, 95, 105, 115], [6, 16, 26, 36, 46, 56, 66, 76, 86, 96, 106, 116], [7, 17, 27, 37, 47, 57, 67, 77, 87, 97, 107, 117], [8, 18, 28, 38, 48, 58, 68, 78, 88, 98, 108, 118], [9, 19, 29, 39, 49, 59, 69, 79, 89, 99, 109, 119]]
     else:
-        raise ValueError(
-            "Current backend with %d qubits is missing a grid configuration"
-            % backend.num_qubits
-        )
+        raise ValueError("Current backend with %d qubits is missing a grid configuration" % backend.num_qubits)
 
     grid_chains = [horz_chain, vert_chain]
 
     return grid_chains
 
 
+
 # --------------------------------- Main Function -------------------------------- #
-def characterize_backend(
+def run_characterization_experiments(
     backend: IBMBackend,
     experiments: Optional[Iterable[str]] = None,
     shots: Optional[Dict[str, int]] = None,
     verbose: bool = True,
 ):
+
     """
     Run selected characterization experiments on the given IBM Quantum backend and update its properties.
 
     Preserved behavior (unchanged from your code):
       - Experiments:
-          * "coherence" : T1/T2 exps.
           * "readout": spam0/spam1 over all qubits
           * "rb_1q": StandardRB per qubit, batched via Parallel+BatchExperiment
           * "rb_2q": LayerFidelity on horizontal & vertical grid layers
-      - Shots defaults: readout=20000, rb_1q=500, rb_2q=500, coherence=2000,
+      - Shots defaults: readout=10000, rb_1q=250, rb_2q=250
       - RB(1q): lengths=[1,50,100,500,1000,3000], num_samples=6, seed=42,
                 separate_jobs=True, max_circuits=3 * num_samples
       - LF(2q): lengths=[1,10,20,30,40,60,80,100,150,200,400], num_samples=12,
@@ -1233,16 +454,15 @@ def characterize_backend(
 
     Args:
         backend: IBM Quantum backend compatible with qiskit-ibm-runtime SamplerV2.
-        experiments: Optional subset of {"coherence", "readout", "rb_1q", "rb_2q"}; defaults to all if None.
-        shots: Optional dict overriding shots, keys in {"coherence", "readout","rb_1q","rb_2q"}.
+        experiments: Optional subset of {"readout", "rb_1q", "rb_2q"}; defaults to all if None.
+        shots: Optional dict overriding shots, keys in {"readout","rb_1q","rb_2q"}.
 
     Returns:
         The same backend instance with its BackendProperties updated in-place.
     """
 
     # ---- Local configuration (no globals) ----
-    allowed_experiments = {"coherence", "readout", "rb_1q", "rb_2q"}
-    print(allowed_experiments)
+    allowed_experiments = {"readout", "rb_1q", "rb_2q"}
 
     rb1q_lengths = np.array([1, 50, 100, 500, 1000, 3000])
     rb1q_num_samples = 6
@@ -1254,15 +474,13 @@ def characterize_backend(
     lf_seed = 60
     lf_max_circuits = 144
 
-    default_shots = {"coherence": 2000, "readout": 20_000, "rb_1q": 500, "rb_2q": 500}
+    default_shots = {"readout": 10_000, "rb_1q": 250, "rb_2q": 250}
     shots = {**default_shots, **(shots or {})}
 
     chosen = set(experiments) if experiments is not None else allowed_experiments
     unknown = chosen - allowed_experiments
     if unknown:
-        raise ValueError(
-            f"Unsupported experiments: {sorted(unknown)}. Allowed: {allowed_experiments}"
-        )
+        raise ValueError(f"Unsupported experiments: {sorted(unknown)}. Allowed: {allowed_experiments}")
 
     # Lightweight printer
     def _emit(msg: str):
@@ -1298,12 +516,17 @@ def characterize_backend(
         )
 
     # ---- Run and collect results ----
+
+    job_ids: Dict[str, Optional[Union[str, List[str]]]] = {"readout": None, "rb_1q": None, "rb_2q": None}
+
     if readout_circuits:
         sampler.options.default_shots = int(shots["readout"])
         job_readout = sampler.run(readout_circuits)
         # Verbose message for readout submission
         try:
-            _emit(f"Readout job submitted: job_id = {job_readout.job_id()}")
+            job_readout_id = job_readout.job_id()
+            job_ids["readout"] = [job_readout_id]
+            _emit(f"Readout job submitted: job_id = {job_readout_id}")
         except Exception:
             _emit("Readout job submitted: job_id = None")
 
@@ -1311,10 +534,9 @@ def characterize_backend(
         sampler.options.default_shots = int(shots["rb_1q"])
         job_sqrb = sqrb_exp.run(sampler=sampler)
         # Verbose message for 1q RB submission
-        job_ids = getattr(job_sqrb, "job_ids", None)
-        _emit(
-            f"Single-qubit RB submitted: job ids = {job_ids if job_ids is not None else 'None'}"
-        )
+        job_1q_ids = getattr(job_sqrb, "job_ids", None)
+        job_ids["rb_1q"] = job_1q_ids
+        _emit(f"Single-qubit RB submitted: job ids = {job_1q_ids if job_1q_ids is not None else 'None'}")
 
     if lf_h and lf_v:
         sampler.options.default_shots = int(shots["rb_2q"])
@@ -1322,41 +544,118 @@ def characterize_backend(
         job_lf_h = lf_h.run(sampler=sampler)
         # Verbose message for layered 2q RB submission
         job_ids_v = getattr(job_lf_v, "job_ids", None)
+        job_ids["rb_2q_v"] = job_ids_v
         job_ids_h = getattr(job_lf_h, "job_ids", None)
-        # Flatten/merge to one list-like representation
+        job_ids["rb_2q_h"] = job_ids_h
+        # Flatten/merge to one list-like representation 
         merged_ids = []
         if job_ids_v is not None:
             merged_ids.extend(job_ids_v if isinstance(job_ids_v, list) else [job_ids_v])
         if job_ids_h is not None:
             merged_ids.extend(job_ids_h if isinstance(job_ids_h, list) else [job_ids_h])
-        _emit(
-            f"Layered two-qubit RB submitted: job_ids = {merged_ids if merged_ids else 'None'}"
+        _emit(f"Layered two-qubit RB submitted: job_ids = {merged_ids if merged_ids else 'None'}")
+
+    return job_ids
+
+def update_backend(
+    backend: IBMBackend,
+    job_ids: Dict[str, Optional[Union[str, List[str]]]],
+    service: QiskitRuntimeService,
+    experiments: Optional[Iterable[str]] = None,
+    shots: Optional[Dict[str, int]] = None,
+    verbose: bool = True,
+):
+
+    """
+    Run characterization experiments and update the backend's properties based on the results.
+    """    
+
+    # ---- Local configuration (no globals) ----
+    allowed_experiments = {"readout", "rb_1q", "rb_2q"}
+
+    rb1q_lengths = np.array([1, 50, 100, 500, 1000, 3000])
+    rb1q_num_samples = 6
+    rb1q_seed = 42
+    rb1q_samples_m = 3  # => max_circuits = 18
+
+    lf_lengths = [1, 10, 20, 30, 40, 60, 80, 100, 150, 200, 400]
+    lf_num_samples = 12
+    lf_seed = 60
+    lf_max_circuits = 144
+
+    default_shots = {"readout": 10_000, "rb_1q": 250, "rb_2q": 250}
+    shots = {**default_shots, **(shots or {})}
+
+    chosen = set(experiments) if experiments is not None else allowed_experiments
+    unknown = chosen - allowed_experiments
+    if unknown:
+        raise ValueError(f"Unsupported experiments: {sorted(unknown)}. Allowed: {allowed_experiments}")
+
+    # Lightweight printer
+    def _emit(msg: str):
+        if verbose:
+            print(msg, flush=True)
+
+    # ---- Build experiments as requested ----
+    sampler = Sampler(mode=backend)
+
+    readout_circuits: Optional[List[QuantumCircuit]] = None
+    if "readout" in chosen:
+        readout_circuits = _build_readout_circuits(backend.num_qubits)
+
+    sqrb_exp: Optional[BatchExperiment] = None
+    if "rb_1q" in chosen:
+        sqrb_exp = _build_oneq_rb_experiments(
+            backend,
+            lengths=rb1q_lengths,
+            num_samples=rb1q_num_samples,
+            seed=rb1q_seed,
+            samples_m=rb1q_samples_m,
         )
-    if "coherence" in chosen:
-        _updated_t1_t2_dict = _update_coherence_errors(
-            backend=backend, sampler=sampler, shots=shots
+
+    lf_h = lf_v = None
+    layers: Optional[List[List[Tuple[int, int]]]] = None
+    if "rb_2q" in chosen:
+        lf_h, lf_v, layers = _build_layered_rb_experiments(
+            backend,
+            lengths=lf_lengths,
+            num_samples=lf_num_samples,
+            seed=lf_seed,
+            max_circuits=lf_max_circuits,
         )
 
     # ---- Build error maps ----
     ro_error_map: Optional[Dict[int, float]] = None
     if readout_circuits:
+        job_readout = service.job(job_ids['readout'][0])
         readout_result = job_readout.result()
         ro_error_map = _get_readout_errors(backend.num_qubits, readout_result)
 
-    oneq_err_x = oneq_err_sx = None
+    oneq_err_x: Optional[Dict[int, float]] = None
+    oneq_err_sx: Optional[Dict[int, float]] = None
     if sqrb_exp:
-        sqrb_result_x = job_sqrb.analysis_results("EPG_x", dataframe=True)
+        expdata = ExperimentData(experiment=sqrb_exp)
+        expdata.add_jobs([service.job(job_id) for job_id in job_ids['rb_1q']])
+        sqrb_exp.analysis.run(expdata, replace_results=True)
+        sqrb_result_x = expdata.analysis_results("EPG_x", dataframe=True)
         oneq_err_x = _get_oneq_errors(sqrb_result_x)
-        sqrb_result_sx = job_sqrb.analysis_results("EPG_sx", dataframe=True)
+        sqrb_result_sx = expdata.analysis_results("EPG_sx", dataframe=True)
         oneq_err_sx = _get_oneq_errors(sqrb_result_sx)
 
     lf_err_map: Optional[Dict[str, float]] = None
     if lf_h and lf_v:
-        lf_result_v = job_lf_v.analysis_results("ProcessFidelity", dataframe=True)
-        lf_result_h = job_lf_h.analysis_results("ProcessFidelity", dataframe=True)
+        expdata = ExperimentData(experiment=lf_v)
+        expdata.add_jobs([service.job(job_id) for job_id in job_ids['rb_2q_v']])
+        lf_v.analysis.run(expdata, replace_results=True)
+        lf_result_v = expdata.analysis_results("ProcessFidelity", dataframe=True)
+        expdata = ExperimentData(experiment=lf_h)
+        expdata.add_jobs([service.job(job_id) for job_id in job_ids['rb_2q_h']])    
+        lf_h.analysis.run(expdata, replace_results=True)   
+        lf_result_h = expdata.analysis_results("ProcessFidelity", dataframe=True)
+
         lf_err_map = _get_twoq_errors(backend, lf_result_h, lf_result_v, layers)
 
-    # ---- Patch properties in place (unchanged behavior) ----
+    # ---- Patch properties in place ----
     backend = copy.deepcopy(backend)
     props_dict = backend.properties().to_dict()
     updated_sections = []
@@ -1374,12 +673,6 @@ def characterize_backend(
         props_dict = _update_lf_props(props_dict, lf_err_map)
         updated_sections.append("two-qubit errors")
 
-    if _updated_t1_t2_dict is not None:
-        props_dict = _update_coherence_props(
-            props=props_dict, error_map=_updated_t1_t2_dict
-        )
-        updated_sections.append("Coherence errors")
-
     if updated_sections:
         _emit(f"Updated backend properties: {', '.join(updated_sections)}")
 
@@ -1391,7 +684,6 @@ def characterize_backend(
 
 # ----------------------------- Plotting Functions --------------------------------- #
 
-
 # ----------------------------- Extractors (unchanged) ----------------------------- #
 def _extract_readout_errors(props_dict: Dict):
     errors = {}
@@ -1401,27 +693,6 @@ def _extract_readout_errors(props_dict: Dict):
                 errors[q] = p["value"]
                 break
     return errors
-
-
-def _extract_t1(props_dict: Dict):
-    t1s = {}
-    for q, q_params in enumerate(props_dict["qubits"]):
-        for p in q_params:
-            if p["name"] == "T1":
-                t1s[q] = p["value"]
-                break
-    return t1s
-
-
-def _extract_t2(props_dict: Dict):
-    t2s = {}
-    for q, q_params in enumerate(props_dict["qubits"]):
-        for p in q_params:
-            if p["name"] == "T2":
-                t2s[q] = p["value"]
-                break
-    return t2s
-
 
 def _extract_oneq_gate_errors(props_dict: Dict):
     """
@@ -1443,7 +714,6 @@ def _extract_oneq_gate_errors(props_dict: Dict):
                     break
     return oneq_errors
 
-
 def _extract_twoq_gate_errors(props_dict: Dict):
     """
     Returns {(q0,q1): error} for 2q gates (cx/cz/ecr).
@@ -1458,7 +728,6 @@ def _extract_twoq_gate_errors(props_dict: Dict):
                     break
     return errors
 
-
 # ----------------------------- Sorting (unchanged) ----------------------------- #
 def _sorted_union_keys(old_map: Dict, new_map: Dict, sort_by="new"):
     """
@@ -1469,7 +738,6 @@ def _sorted_union_keys(old_map: Dict, new_map: Dict, sort_by="new"):
     NaNs are sent to the end.
     """
     keys = sorted(set(old_map.keys()) | set(new_map.keys()))
-
     def _val(k, which):
         if which == "new":
             return new_map.get(k, np.nan)
@@ -1481,14 +749,10 @@ def _sorted_union_keys(old_map: Dict, new_map: Dict, sort_by="new"):
             return np.nanmax([v_old, v_new])
         else:
             raise ValueError("sort_by must be 'new', 'old', or 'max'")
-
     return sorted(keys, key=lambda k: (np.isnan(_val(k, sort_by)), _val(k, sort_by)))
 
-
 # ----------------------------- Style helpers (unchanged) ----------------------------- #
-def _set_every_xtick_with_vertical_guides(
-    ax, labels, *, rotation=90, fontsize=7, weight="regular"
-):
+def _set_every_xtick_with_vertical_guides(ax, labels, *, rotation=90, fontsize=7, weight="regular"):
     """
     Keep ALL ticks, rotate labels (default 90°), shrink font,
     and draw a faint vertical gridline at EVERY tick position.
@@ -1519,27 +783,9 @@ def _set_every_xtick_with_vertical_guides(
     fig = ax.get_figure()
     fig.subplots_adjust(bottom=0.28 if rotation == 90 else 0.20)
 
-
 def _plot_lines(ax, x_idx, y_old, y_new, *, lw=1.1, ms=3.0):
-    ax.plot(
-        x_idx,
-        y_old,
-        color="tab:red",
-        marker="o",
-        linewidth=lw,
-        markersize=ms,
-        label="Error (reported)",
-    )
-    ax.plot(
-        x_idx,
-        y_new,
-        color="tab:blue",
-        marker="o",
-        linewidth=lw,
-        markersize=ms,
-        label="Error (measured)",
-    )
-
+    ax.plot(x_idx, y_old, color="tab:red",  marker="o", linewidth=lw, markersize=ms, label="Error (reported)")
+    ax.plot(x_idx, y_new, color="tab:blue", marker="o", linewidth=lw, markersize=ms, label="Error (measured)")
 
 # ----------------------------- NEW: sort label mapper ----------------------------- #
 def _sort_label(sort_by: str) -> str:
@@ -1559,21 +805,18 @@ def _sort_label(sort_by: str) -> str:
     except KeyError:
         raise ValueError("sort_by must be 'new', 'old', or 'max'")
 
-
 # ----------------------------- Main plotter (titles updated) ----------------------------- #
 def plot_characterization_comparison(
     old_props: Dict,
     new_props: Dict,
-    sort_by="new",  # "new" | "old" | "max"
-    title_prefix=None,  # optional prefix (e.g., backend name)
+    sort_by="new",              # "new" | "old" | "max"
+    title_prefix=None,          # optional prefix (e.g., backend name)
 ):
     """
     Create three comparison plots with ALL tick labels kept and styled:
-      1) T1
-      2) T2
-      3) Readout error (linear y)
-      4) Single-qubit RB EPG (sx/x) (log y)
-      5) Layered 2Q RB EPG (log y)
+      1) Readout error (linear y)
+      2) Single-qubit RB EPG (sx/x) (log y)
+      3) Layered 2Q RB EPG (log y)
 
     Titles now say: 'sorted by measured' (or 'reported' / 'max(measured, reported)').
     """
@@ -1583,76 +826,20 @@ def plot_characterization_comparison(
     # ---------------- FORMAT -----------------
 
     # Figure sizes
-    readout_figsize = (18, 5.5)
-    oneq_figsize = (18, 5.5)
-    twoq_figsize = (22, 6.5)
+    readout_figsize=(18, 5.5)
+    oneq_figsize=(18, 5.5)
+    twoq_figsize=(22, 6.5)
     # Label styling
-    readout_label_fontsize = 7
-    oneq_label_fontsize = 7
-    twoq_label_fontsize = 7
-    readout_rotation = 90
-    oneq_rotation = 90
-    twoq_rotation = 90
+    readout_label_fontsize=7
+    oneq_label_fontsize=7
+    twoq_label_fontsize=7
+    readout_rotation=90
+    oneq_rotation=90
+    twoq_rotation=90
     # Lines
-    line_width = 1.1
-    marker_size = 3.0
-    now = datetime.now()
-    readable_dt = now.strftime("%B %d, %Y - %I:%M %p")
+    line_width=1.1
+    marker_size=3.0
 
-    # ---------------- T1 ----------------
-    old_t1 = _extract_t1(old_props)
-    new_t1 = _extract_t1(new_props)
-
-    keys_co = _sorted_union_keys(old_t1, new_t1, sort_by=sort_by)
-    if keys_co:
-        y_old = [old_t1.get(k, np.nan) for k in keys_co]
-        y_new = [new_t1.get(k, np.nan) for k in keys_co]
-        x_idx = np.arange(len(keys_co))
-
-        fig, ax = plt.subplots(figsize=readout_figsize)
-        ax.set_title(
-            f"{prefix}T1s — measured vs reported (sorted by {sort_friendly}) plotted at {readable_dt}"
-        )
-        _plot_lines(ax, x_idx, y_old, y_new, lw=line_width, ms=marker_size)
-        ax.set_xlabel("Qubit")
-        ax.set_ylabel(r"T1s $(\mu s)$")
-        _set_every_xtick_with_vertical_guides(
-            ax,
-            [str(k) for k in keys_co],
-            rotation=readout_rotation,
-            fontsize=readout_label_fontsize,
-        )
-        ax.grid(True, axis="y", alpha=0.3)
-        ax.legend(loc="upper left")
-        fig.tight_layout()
-        plt.show()
-
-    # ---------------- T2 ----------------
-    old_t2 = _extract_t2(old_props)
-    new_t2 = _extract_t2(new_props)
-    keys_co = _sorted_union_keys(old_t1, new_t1, sort_by=sort_by)
-    if keys_co:
-        y_old = [old_t2.get(k, np.nan) for k in keys_co]
-        y_new = [new_t2.get(k, np.nan) for k in keys_co]
-        x_idx = np.arange(len(keys_co))
-
-        fig, ax = plt.subplots(figsize=readout_figsize)
-        ax.set_title(
-            rf"{prefix}T2s — measured vs reported (sorted by {sort_friendly}) plotted at {readable_dt}"
-        )
-        _plot_lines(ax, x_idx, y_old, y_new, lw=line_width, ms=marker_size)
-        ax.set_xlabel("Qubit")
-        ax.set_ylabel(r"T2s $(\mu s)$")
-        _set_every_xtick_with_vertical_guides(
-            ax,
-            [str(k) for k in keys_co],
-            rotation=readout_rotation,
-            fontsize=readout_label_fontsize,
-        )
-        ax.grid(True, axis="y", alpha=0.3)
-        ax.legend(loc="upper left")
-        fig.tight_layout()
-        plt.show()
     # ---------------- READOUT ----------------
     old_ro = _extract_readout_errors(old_props)
     new_ro = _extract_readout_errors(new_props)
@@ -1663,17 +850,13 @@ def plot_characterization_comparison(
         x_idx = np.arange(len(keys_ro))
 
         fig, ax = plt.subplots(figsize=readout_figsize)
-        ax.set_title(
-            f"{prefix}Readout Error — measured vs reported (sorted by {sort_friendly} plotted at {readable_dt})"
-        )
+        ax.set_title(f"{prefix}Readout Error — measured vs reported (sorted by {sort_friendly})")
         _plot_lines(ax, x_idx, y_old, y_new, lw=line_width, ms=marker_size)
         ax.set_xlabel("Qubit")
         ax.set_ylabel("Readout error")
         _set_every_xtick_with_vertical_guides(
-            ax,
-            [str(k) for k in keys_ro],
-            rotation=readout_rotation,
-            fontsize=readout_label_fontsize,
+            ax, [str(k) for k in keys_ro],
+            rotation=readout_rotation, fontsize=readout_label_fontsize
         )
         ax.grid(True, axis="y", alpha=0.3)
         ax.legend(loc="upper left")
@@ -1690,18 +873,14 @@ def plot_characterization_comparison(
         x_idx = np.arange(len(keys_1q))
 
         fig, ax = plt.subplots(figsize=oneq_figsize)
-        ax.set_title(
-            f"{prefix}1Q RB EPG (sx/x) — measured vs reported (sorted by {sort_friendly}) plotted at {readable_dt}"
-        )
+        ax.set_title(f"{prefix}1Q RB EPG (sx/x) — measured vs reported (sorted by {sort_friendly})")
         _plot_lines(ax, x_idx, y_old, y_new, lw=line_width, ms=marker_size)
         ax.set_xlabel("Qubit")
         ax.set_ylabel("EPG (1Q)")
         ax.set_yscale("log")
         _set_every_xtick_with_vertical_guides(
-            ax,
-            [str(k) for k in keys_1q],
-            rotation=oneq_rotation,
-            fontsize=oneq_label_fontsize,
+            ax, [str(k) for k in keys_1q],
+            rotation=oneq_rotation, fontsize=oneq_label_fontsize
         )
         ax.grid(True, axis="y", which="both", alpha=0.3)
         ax.legend(loc="upper left")
@@ -1719,129 +898,16 @@ def plot_characterization_comparison(
         x_idx = np.arange(len(keys_2q))
 
         fig, ax = plt.subplots(figsize=twoq_figsize)
-        ax.set_title(
-            f"{prefix}Layered 2Q RB EPG — measured vs reported (sorted by {sort_friendly}, plotted at {readable_dt})"
-        )
+        ax.set_title(f"{prefix}Layered 2Q RB EPG — measured vs reported (sorted by {sort_friendly})")
         _plot_lines(ax, x_idx, y_old, y_new, lw=line_width, ms=marker_size)
         ax.set_xlabel("2Q gate")
         ax.set_ylabel("EPG (2Q)")
         ax.set_yscale("log")
         _set_every_xtick_with_vertical_guides(
-            ax, labels, rotation=twoq_rotation, fontsize=twoq_label_fontsize
+            ax, labels,
+            rotation=twoq_rotation, fontsize=twoq_label_fontsize
         )
         ax.grid(True, axis="y", which="both", alpha=0.3)
         ax.legend(loc="upper left")
         fig.tight_layout()
         plt.show()
-
-
-# ---------------- Coherence experiments ----------------
-def batch_nodes(backend, keepout_distance=2):
-    """
-    Partitions qubits into batches where no two nodes in the same batch
-    are within 'keepout_distance' in the input graph.
-
-    Args:
-        backend: IBM backend object.
-        keepout_distance: int, the minimum number of hops required between
-                          any two nodes in the same batch.
-
-    Returns:
-        List of sets, where each set is a batch of nodes.
-
-    """
-
-    qubits = range(backend.target.num_qubits)
-    pairs = list(backend.coupling_map.get_edges())
-
-    graph = nx.Graph()
-    graph.add_nodes_from(qubits)
-    graph.add_edges_from(pairs)
-
-    # Create conflict graph
-    conflict_graph = nx.Graph()
-    conflict_graph.add_nodes_from(qubits)
-
-    for qubit in qubits:
-        # BFS up to keepout_distance to find nodes to avoid batching with
-        neighbors = nx.single_source_shortest_path_length(
-            graph, qubit, cutoff=keepout_distance
-        )
-        for neighbor in neighbors:
-            if neighbor != qubit:
-                conflict_graph.add_edge(qubit, neighbor)
-
-    # Greedy coloring of conflict graph
-    coloring = nx.coloring.greedy_color(conflict_graph, strategy="largest_first")
-
-    # Group by color
-    batches = {}
-    for node, color in coloring.items():
-        batches.setdefault(color, set()).add(node)
-
-    return list(batches.values())
-
-
-def _update_coherence_errors(backend: Backend, sampler: Sampler, shots: Dict) -> Dict:
-    t1_t_decades = 4
-    t1_t_max = 600e-6
-    t1_t_steps = 41
-    num_echoes = 1
-    t1_delays = np.logspace(
-        np.log10(t1_t_max) - t1_t_decades, np.log10(t1_t_max), t1_t_steps
-    ) - 10 ** (np.log10(t1_t_max) - t1_t_decades)
-    t1_delays
-
-    t2_t_decades = 4
-    t2_t_max = 600e-6
-    t2_t_steps = 41
-
-    t2_delays = np.logspace(
-        np.log10(t2_t_max) - t2_t_decades, np.log10(t2_t_max), t2_t_steps
-    ) - 10 ** (np.log10(t2_t_max) - t2_t_decades)
-
-    # Create T1 experiments on all qubit in parallel
-    t1_exp = ParallelExperiment(
-        [
-            T1(physical_qubits=[qubit], delays=t1_delays)
-            for qubit in range(backend.target.num_qubits)
-        ],
-        backend,
-        analysis=None,
-    )
-
-    t2_batches = batch_nodes(backend, keepout_distance=1)
-
-    t2_exp = BatchExperiment(
-        [
-            ParallelExperiment(
-                [
-                    T2Hahn(
-                        physical_qubits=(qubit,),
-                        delays=t2_delays,
-                        num_echoes=num_echoes,
-                    )
-                    for qubit in batch
-                ],
-                backend,
-                analysis=None,
-            )
-            for batch in t2_batches
-        ]
-    )
-    coherence_exp = BatchExperiment([t1_exp, t2_exp], backend)
-
-    print("Submitting coherence experiments")
-    coherence_exp_data = coherence_exp.run(sampler=sampler, shots=shots["coherence"])
-
-    err_coh = {
-        result.device_components[0].index: {}
-        for result in coherence_exp_data.analysis_results()
-    }
-    for result in coherence_exp_data.analysis_results():
-        err_coh[result.device_components[0].index].update(
-            {result.name: 1e6 * result.value.nominal_value}
-        )
-    print("Coherence analysis completed")
-
-    return err_coh

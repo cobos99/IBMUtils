@@ -347,6 +347,10 @@ def perform_linear_zne(noise_rates, measurements):
     measurements = np.array(measurements).flatten()
     if noise_rates.shape != measurements.shape:
         raise ValueError("Noise rates and measurements must have the same shape.")
+    if len(noise_rates) > 1 and np.all(noise_rates == noise_rates[0]):
+        # Several measurements at the same noise rate (e.g. circuits without amplified noise) have nothing to extrapolate,
+        # the zero noise estimate is their mean
+        return ZNEResult(0.0, np.mean(measurements), np.nan, np.nan, np.std(measurements, ddof=1) / np.sqrt(len(measurements)))
     return ZNEResult(*linregress(noise_rates, measurements))
 
 def perform_exponential_zne(noise_rates, measurements, p0=None):

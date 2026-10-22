@@ -6,6 +6,8 @@ import hardware.utils.characterization as characterization
 import hardware.utils.benchmarks as benchmarks
 from qiskit.transpiler import PassManager
 import hardware.utils.circs as circutils
+import hardware.utils.misc as miscutils
+from qiskit import QuantumCircuit
 import numpy as np
 
 def multirep_structure(job_elements, nrepetitions, cal_elements=None, repeat_cal=False):
@@ -13,9 +15,9 @@ def multirep_structure(job_elements, nrepetitions, cal_elements=None, repeat_cal
         raise ValueError("nrepetitions must be a positive integer")
     nrepetitions = int(nrepetitions)
     
-    job_elements = numpy_array_of_circuits(job_elements)
+    job_elements = miscutils.numpy_array_of_witerables(job_elements)
     if cal_elements is not None:
-        cal_elements = numpy_array_of_circuits(cal_elements)
+        cal_elements = miscutils.numpy_array_of_witerables(cal_elements)
         if job_elements.shape != cal_elements.shape:
             raise ValueError("If provided, cal_elements must have the same shape as job_elements")
         
@@ -27,23 +29,26 @@ def multirep_structure(job_elements, nrepetitions, cal_elements=None, repeat_cal
             cal_elements = cal_elements[None]
 
     if cal_elements is not None:
-        circuits_to_run = []
-        for ilayout in range(job_elements.shape[0]):
-            if repeat_cal:
-                this_layout_circuits = np.full((*circ_shape[1:-1], 2*nrepetitions*circ_shape[-1]), None, dtype=object)
-                repeated_job_circuits = np.repeat(job_elements[ilayout], nrepetitions, axis=-1)
-                repeated_cal_circuits = np.repeat(cal_elements[ilayout], nrepetitions, axis=-1)
-                this_layout_circuits[..., 0::2] = repeated_cal_circuits
-                this_layout_circuits[..., 1::2] = repeated_job_circuits
-                circuits_to_run.append(this_layout_circuits)
-            else:
-                this_layout_circuits = np.full((*circ_shape[1:-1], (nrepetitions+1)*circ_shape[-1]), None, dtype=object)
-                for i in range(circ_shape[-1]):
-                    this_layout_circuits[..., i*(nrepetitions+1)] = cal_elements[ilayout, ..., i]
-                    this_jobs = job_elements[ilayout, ..., i]
-                    this_layout_circuits[..., i*(nrepetitions+1)+1:(i+1)*(nrepetitions+1)] = np.repeat(this_jobs.reshape(*this_jobs.shape, 1), nrepetitions, axis=-1)
-                circuits_to_run.append(this_layout_circuits)
-        circuits_to_run = np.array(circuits_to_run)
+        if job_elements.shape != cal_elements.shape:
+            circuits_to_run = np.concatenate([np.repeat(cal_elements, nrepetitions, axis=-1), np.repeat(job_elements, nrepetitions, axis=-1)], axis=-1)
+        else:
+            circuits_to_run = []
+            for ilayout in range(job_elements.shape[0]):
+                if repeat_cal:
+                    this_layout_circuits = np.full((*circ_shape[1:-1], 2*nrepetitions*circ_shape[-1]), None, dtype=object)
+                    repeated_job_circuits = np.repeat(job_elements[ilayout], nrepetitions, axis=-1)
+                    repeated_cal_circuits = np.repeat(cal_elements[ilayout], nrepetitions, axis=-1)
+                    this_layout_circuits[..., 0::2] = repeated_cal_circuits
+                    this_layout_circuits[..., 1::2] = repeated_job_circuits
+                    circuits_to_run.append(this_layout_circuits)
+                else:
+                    this_layout_circuits = np.full((*circ_shape[1:-1], (nrepetitions+1)*circ_shape[-1]), None, dtype=object)
+                    for i in range(circ_shape[-1]):
+                        this_layout_circuits[..., i*(nrepetitions+1)] = cal_elements[ilayout, ..., i]
+                        this_jobs = job_elements[ilayout, ..., i]
+                        this_layout_circuits[..., i*(nrepetitions+1)+1:(i+1)*(nrepetitions+1)] = np.repeat(this_jobs.reshape(*this_jobs.shape, 1), nrepetitions, axis=-1)
+                    circuits_to_run.append(this_layout_circuits)
+            circuits_to_run = np.array(circuits_to_run)
     else:
         circuits_to_run = np.repeat(job_elements, nrepetitions, axis=-1)
     return np.array(circuits_to_run)
@@ -133,7 +138,7 @@ def execute_sampler_batch(backend, sampler_opt_dict, job_circuits, cal_circuits=
     
     return jobs
 
-def execute_sampler_batch_choosing_layout(backend, sampler_opt_dict, job_log_circuits, cal_log_circuits=None, repeat_cal=False, db_options=None, job_db=None, share_total_shots=False, optimization_level=3, max_shots=75000):
+def execute_sampler_batch_choosing_layout(backend, service, sampler_opt_dict, job_log_circuits, cal_log_circuits=None, repeat_cal=False, db_options=None, job_db=None, share_total_shots=False, optimization_level=3, max_shots=75000):
     job_log_circuits = numpy_array_of_circuits(job_log_circuits)
     if cal_log_circuits is not None:
         cal_log_circuits = numpy_array_of_circuits(cal_log_circuits)
@@ -187,7 +192,9 @@ def execute_sampler_batch_choosing_layout(backend, sampler_opt_dict, job_log_cir
     with Session(backend=backend) as session:
         batch_options["batch_id"] = session.session_id
         # target = benchmarks.update_target(backend, session)
-        backend_updated = characterization.characterize_backend(backend=backend, experiments=['coherence', 'readout', 'rb_1q', 'rb_2q'])
+        # backend_updated = characterization.characterize_backend(backend=backend, experiments=['coherence', 'readout', 'rb_1q', 'rb_2q'])
+        experiments_ids = characterization.run_characterization_experiments(backend)
+        backend_updated = characterization.update_backend(backend, experiments_ids, service=service)
         # Transpile circuits choosing best layout
         pm = generate_preset_pass_manager(backend=backend_updated, optimization_level=optimization_level)
         flatten_job_log_circuits = numpy_array_of_circuits(job_log_circuits).flatten()
@@ -436,6 +443,101 @@ def execute_znepea(backend, job_tbarrier_circuits, parameters_func, db_options, 
         job_db.add(all_options, job_tbarrier_circuits, "ZNE-PEA", job_ids)
 
     return jobs
+
+def execute_executor_layout_session(backend, service, job_log_circuits,
+                                    cal_log_circuits=None,
+                                    shots=2**15,
+                                    samplex_config_func=None, 
+                                    samplex_shape=None,
+                                    non_markovian_post=False,
+                                    db_options={},
+                                    box_kwargs={},
+                                    job_db=None,
+                                    nrepetitions=1,
+                                    optimization_level=3,
+                                    session_maxtime=3600):
+    job_log_circuits = numpy_array_of_circuits(job_log_circuits)
+    job_log_circuits_shape = job_log_circuits.shape
+
+    print(f"\rPreparing samplexes for execution...")
+    box_job_circuits = circutils.box_circuits(job_log_circuits,
+                                              enable_gates=True, 
+                                              enable_measures=True,
+                                              twirling_strategy="active_circuit")
+    if cal_log_circuits is not None:
+        box_cal_circuits = circutils.box_circuits(cal_log_circuits,
+                                                  enable_gates=True, 
+                                                  enable_measures=True,
+                                                  twirling_strategy="active_circuit")
+    
+    job_templates, job_samplexes = circutils.samplomatic_build(box_job_circuits)
+    if cal_log_circuits is not None:
+        cal_templates, cal_samplexes = circutils.samplomatic_build(box_cal_circuits)
+
+    # Prepare dummy job
+    dummy_circ = QuantumCircuit(1)
+    dummy_circ.measure_all()
+    dummy_pm = generate_preset_pass_manager(backend=backend, optimization_level=3)
+    dummy_circ = dummy_pm.run(dummy_circ)
+
+    batch_options = {}
+    with Session(backend=backend, max_time=session_maxtime) as session:
+        batch_options["batch_id"] = session.session_id
+        print("\rRunning characterization experiments...")
+        dummy_sampler = SamplerV2(mode=session, options={"default_shots": 2**11})
+        characterization_experiments = ["readout", "rb_1q", "rb_2q"]
+        characterization_ids = characterization.run_characterization_experiments(backend=backend, experiments=characterization_experiments)
+        backend_updated = characterization.update_backend(service=service,backend=backend, experiments=characterization_experiments, job_ids=characterization_ids)
+
+        dummy_sampler.run([dummy_circ])
+
+        print("\rTranspiling circuits with chosen layout...")
+        pm = generate_preset_pass_manager(backend=backend_updated, optimization_level=optimization_level)
+        flatten_job_log_circuits = numpy_array_of_circuits(job_log_circuits).flatten()
+        depths = np.array([circutils.depth2qb(c) for c in flatten_job_log_circuits])
+        longest_circuit_ind = np.argmax(depths)
+        transpiled_longest_circuit = pm.run(flatten_job_log_circuits[longest_circuit_ind])
+        chosen_layout = transpiled_longest_circuit.layout.final_index_layout()
+        job_circuits = circutils.transpile_circuits_with_consistent_layout(job_log_circuits, backend_updated, layout=chosen_layout).flatten().tolist()
+
+        dummy_sampler.run([dummy_circ])
+
+        boxed_job_circuits = circutils.box_circuits(job_circuits, **box_kwargs)
+        job_templates, job_samplexes = circutils.samplomatic_build(boxed_job_circuits)
+        post_selection_pm = PassManager([AddSpectatorMeasures(backend.coupling_map), AddPostSelectionMeasures(x_pulse_type="rx"),])
+        if non_markovian_post:
+            job_templates = post_selection_pm.run(job_templates)
+        if cal_log_circuits is not None:
+            dummy_sampler.run([dummy_circ])
+            cal_circuits = circutils.transpile_circuits_with_consistent_layout(cal_log_circuits, backend_updated, layout=chosen_layout).flatten().tolist()
+            boxed_cal_circuits = circutils.box_circuits(cal_circuits, **box_kwargs)
+            cal_templates, cal_samplexes = circutils.samplomatic_build(boxed_cal_circuits)
+            if non_markovian_post:
+                cal_templates = post_selection_pm.run(cal_templates)
+
+        templates_to_run = multirep_structure(job_templates, nrepetitions=nrepetitions, cal_elements=cal_templates if cal_log_circuits is not None else None, repeat_cal=False).flatten().tolist()
+        samplexes_to_run = multirep_structure(job_samplexes, nrepetitions=nrepetitions, cal_elements=cal_samplexes if cal_log_circuits is not None else None, repeat_cal=False).flatten().tolist()
+        print("\rSubmitting jobs...")
+        jobs = []
+        executor = Executor(mode=session)
+        for template, samplex in zip(templates_to_run, samplexes_to_run):
+            samplex_arguments = samplex_config_func(samplex) if samplex_config_func is not None else {}
+            program = QuantumProgram(shots=shots)
+            program.append_samplex_item(
+                circuit=template,
+                samplex=samplex,
+                samplex_arguments=samplex_arguments,
+                shape=samplex_shape
+            )
+            jobs.append(executor.run(program))
+            
+        if job_db is not None:
+            batch_options = {"job_circuits_shape": job_log_circuits_shape, "cal_circuits_shape": None, "nrepetitions": nrepetitions, "shots": shots, "optimization_level": optimization_level, "repeat_cal": False, "non_markovian_post": non_markovian_post}
+            job_ids = [job.job_id() for job in jobs]
+            all_options = db_options | batch_options
+            job_db.add(all_options, job_circuits, "Executor", job_ids)
+
+        return jobs
 
 def execute_znepea_choosing_layout(backend, job_log_barrier_circuits, parameters_func, db_options, uinst_filter_func=None, job_db=None, optimization_level=3):
     znepea_options_check(db_options)

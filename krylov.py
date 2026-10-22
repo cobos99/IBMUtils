@@ -13,16 +13,34 @@ def times_matrix(krylov_dt, krylov_dim):
     times_matrix = (times_row_col[:, None] - times_row_col[None, :]).T
     return times_matrix
 
-def observables_to_matrix(observables, constant=1, sign_lower_triangular=1):
+def observables_to_matrix(observables, confidence=None, constant=1, sign_lower_triangular=1):
     observables = np.array(observables)
     if len(observables.shape) != 1:
         raise ValueError("observables must be a 1D array-like")
     matrix = np.zeros((len(observables), len(observables)), dtype=complex)
-    np.fill_diagonal(matrix, constant * observables[0])
-    matrix[0, :] = constant * observables
+    # Hermitian Toeplitz: the diagonal must be real (matches Julia's Hermitian(), which drops the imaginary part)
+    np.fill_diagonal(matrix, np.real(constant * observables[0]))
+    matrix[0, 1:] = constant * observables[1:]
     for i in range(1, len(observables)):
         matrix[i, :i] = np.conj(matrix[0, 1:i+1])[::-1]
         matrix[i, i+1:] = (matrix[0, 1:len(observables)-i])
+    if confidence is not None:
+        confidence = np.array(confidence)
+        if len(confidence.shape) != 2 or confidence.shape[1] != 2:
+            raise ValueError("confidence must be a 2D array-like with shape (n, 2)")
+        if len(confidence) != len(observables):
+            raise ValueError("confidence must have the same length as observables")
+        matrix_confidence = np.zeros((len(observables), len(observables), 2), dtype=complex)
+        np.fill_diagonal(matrix_confidence[:, :, 0], np.real(constant * confidence[0, 0]))
+        np.fill_diagonal(matrix_confidence[:, :, 1], np.real(constant * confidence[0, 1]))
+        matrix_confidence[0, 1:, 0] = constant * confidence[1:, 0]
+        matrix_confidence[0, 1:, 1] = constant * confidence[1:, 1]
+        for i in range(1, len(observables)):
+            matrix_confidence[i, :i, 0] = np.conj(matrix_confidence[0, 1:i+1, 0])[::-1]
+            matrix_confidence[i, :i, 1] = np.conj(matrix_confidence[0, 1:i+1, 1])[::-1]
+            matrix_confidence[i, i+1:, 0] = (matrix_confidence[0, 1:len(observables)-i, 0])
+            matrix_confidence[i, i+1:, 1] = (matrix_confidence[0, 1:len(observables)-i, 1])
+        return matrix, matrix_confidence
     return matrix
 
 def fix_T_first_grouping(groupings, T_op):

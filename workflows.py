@@ -1,3 +1,4 @@
+from qiskit_addon_utils.noise_management.post_selection import PostSelector
 from juliacall import Main as jl, convert as jlconvert
 from qiskit.quantum_info import Pauli, PauliList
 import hardware.utils.executor as executorutils
@@ -5,8 +6,8 @@ from qiskit.result import QuasiDistribution
 import hardware.utils.postselection as ps
 import hardware.utils.measure as measure
 import hardware.utils.samples as samples
-import hardware.utils.zne as znemod
 import hardware.utils.misc as miscutils
+import hardware.utils.zne as znemod
 import hardware.utils.trex as trex
 import hardware.utils.odr as odr
 import hardware.utils.dec as dec
@@ -446,6 +447,7 @@ def postselection_zne(job_samples, job_data, postselection_genfunc, observables_
 
 def odrzne(job_samples, cal_samples, job_data, postselection_genfunc, observables_genfuncs, 
            flip_threshold=None, flipped_syndromes=None, minimum_shots=None,
+           postselect_calibration=True,
            odr_expected_observable=1,
            zne_func=znemod.perform_linear_zne,
            confidence=None,
@@ -464,21 +466,33 @@ def odrzne(job_samples, cal_samples, job_data, postselection_genfunc, observable
     # raw_observables_shape = (*job_data["job_circuits_shape"], len(observables_genfuncs))
     job_samples = np.array(job_samples, dtype=object).T.flatten()
     cal_samples = np.array(cal_samples, dtype=object).T.flatten()
-    nqubits = len(list(job_samples[0].keys())[0])
+    for samples in job_samples:
+        try:
+            nqubits = len(list(samples.keys())[0])
+            break
+        except IndexError:
+            continue
     postselection_operators, diagonal_observbles_ops, non_diagonal_observables_ops, basis = ps.initialize_postselection(nqubits, postselection_genfunc, observables_genfuncs)
     if non_diagonal_observables_ops:
         raise ValueError("The provided observables are not diagonal in the Z basis")
     if len(noise_rates) != raw_observables_shape[0]:
         raise ValueError("The length of noise_rates must match the first dimension of job_samples")
+    # The noise factors are the same for all the times, or with shape (nnoise_factors, ntimes) the noise factors of every circuit
+    if noise_rates.ndim == 2 and noise_rates.shape[1] != raw_observables_shape[1]:
+        raise ValueError("Noise factors with shape (nnoise_factors, ntimes) must have a column per time of job_samples")
 
     if verbose: print("\rGenerating postselected samples...".ljust(100), end="")
-    postselected_samples = ps.get_recovered_samples(job_samples, postselection_operators, 
-                                                    flip_threshold=flip_threshold, flipped_syndromes=flipped_syndromes, 
+    postselected_samples = ps.get_recovered_samples(job_samples, postselection_operators,
+                                                    flip_threshold=flip_threshold, flipped_syndromes=flipped_syndromes,
                                                     minimum_shots=minimum_shots)
 
-    postselected_cal_samples = ps.get_recovered_samples(cal_samples, postselection_operators,
-                                                        flip_threshold=flip_threshold, flipped_syndromes=flipped_syndromes, 
-                                                        minimum_shots=minimum_shots)
+    if postselect_calibration:
+        postselected_cal_samples = ps.get_recovered_samples(cal_samples, postselection_operators,
+                                                            flip_threshold=flip_threshold, flipped_syndromes=flipped_syndromes, 
+                                                            minimum_shots=minimum_shots)
+    else:
+        # The calibration observables that set the ODR rates (Post cal) are measured without gauge recovery
+        postselected_cal_samples = cal_samples
 
     # Measure observables
     if verbose: print("\rMeasuring diagonal observables...".ljust(100), end="")
@@ -506,9 +520,10 @@ def odrzne(job_samples, cal_samples, job_data, postselection_genfunc, observable
     zne_observables = np.full(raw_observables_shape[1::], np.nan)
     zne_observables_confidence = np.full((*raw_observables_shape[1::], 2), np.nan)
     for ti in range(raw_observables_shape[1]):
+        time_noise_rates = noise_rates[:, ti] if noise_rates.ndim == 2 else noise_rates
         for oind in range(raw_observables_shape[2]):
             observables_for_reg = clean_observables[:, ti, oind]
-            zne_results = zne_func(noise_rates, observables_for_reg)
+            zne_results = zne_func(time_noise_rates, observables_for_reg)
             zne_observables[ti, oind] = zne_results.intercept
             zne_observables_confidence[ti, oind, 0] = zne_results.intercept - zne_results.std_err
             zne_observables_confidence[ti, oind, 1] = zne_results.intercept + zne_results.std_err
@@ -516,11 +531,168 @@ def odrzne(job_samples, cal_samples, job_data, postselection_genfunc, observable
     if verbose: print(f"\rLoaded {len(job_samples.flatten())} jobs".ljust(100))
     to_return = [[zne_observables, clean_observables, postselected_observables, postselected_cal_observables, raw_observables]]
     if confidence is not None:
-        to_return.append([zne_observables_confidence, clean_observables_confidence, postselected_observables_confidence, raw_observables_confidence])
+        to_return.append([zne_observables_confidence, clean_observables_confidence, postselected_observables_confidence, postselected_cal_observables_confidence, raw_observables_confidence])
     if return_samples:
         to_return.append([job_samples, cal_samples])
     if return_postselected_samples:
         to_return.append([postselected_samples, postselected_cal_samples])
+    return to_return if len(to_return) > 1 else to_return[0]
+
+def odrzne_gaugetwirling(job_samples, cal_samples, job_data, postselection_genfunc, observables_genfuncs,
+                         flip_threshold=None, flipped_syndromes=None, minimum_shots=None,
+                         postselect_calibration=True,
+                         odr_expected_observable=1,
+                         zne_func=znemod.perform_linear_zne,
+                         confidence=None,
+                         return_samples=False, return_postselected_samples=False,
+                         verbose=False):
+    # Same as odrzne but for the batches of z2hm_tdepsb_gaugetwirling_submit.py, with samples of shape
+    # (nnoise_factors, ntimes, ngt_randomizations) as returned by ExecDB.load_final_samples_from_local_or_ibmq.
+    # The randomizations are merged into a single samples dict per circuit before the recovery, since
+    # the recovery (flip_threshold, minimum_shots) depends on the full distribution and not shot by shot.
+    # The gauge twirling gates are logically the identity, so no relabeling of the bitstrings is needed.
+    try:
+        noise_factors = job_data["noise_factors"]
+    except KeyError:
+        try:
+            noise_factors = job_data["noise_rates"]
+        except KeyError:
+            raise WorkflowError("job_data must contain the 'noise_factors' or 'noise_rates' key")
+    job_samples = np.array(job_samples, dtype=object)
+    cal_samples = np.array(cal_samples, dtype=object)
+    if job_samples.shape != cal_samples.shape:
+        raise ValueError("job_samples and cal_samples must have the same shape")
+    if job_samples.ndim == 3:
+        ngt = job_data.get("num_gt_randomizations", None)
+        if ngt is not None and ngt != job_samples.shape[-1]:
+            raise WorkflowError(f"The last axis of the samples ({job_samples.shape[-1]}) does not match 'num_gt_randomizations' ({ngt})")
+        if verbose: print(f"\rCombining samples dicts from {job_samples.shape[-1]} gauge twirling randomizations...".ljust(100), end="")
+        job_samples = samples.combine_samples_dicts(job_samples)
+        cal_samples = samples.combine_samples_dicts(cal_samples)
+    elif job_samples.ndim != 2:
+        raise ValueError("job_samples and cal_samples must have shape (nnoise_factors, ntimes, ngt_randomizations) or (nnoise_factors, ntimes)")
+    if len(noise_factors) != job_samples.shape[0]:
+        raise ValueError("The length of noise_factors must match the first dimension of job_samples")
+
+    # odrzne expects samples with shape (ntimes, nnoise_factors), as in execute_sampler_batch(job_circuits=circuits.T)
+    odrzne_job_data = dict(job_data)
+    odrzne_job_data["noise_factors"] = noise_factors
+    odrzne_job_data["job_circuits_shape"] = job_samples.T.shape
+    return odrzne(job_samples.T, cal_samples.T, odrzne_job_data, postselection_genfunc, observables_genfuncs,
+                  flip_threshold=flip_threshold, flipped_syndromes=flipped_syndromes, minimum_shots=minimum_shots,
+                  postselect_calibration=postselect_calibration,
+                  odr_expected_observable=odr_expected_observable,
+                  zne_func=zne_func,
+                  confidence=confidence,
+                  return_samples=return_samples, return_postselected_samples=return_postselected_samples,
+                  verbose=verbose)
+
+def odrzne_executor(job_results, cal_results, job_data, postselection_genfunc, observables_genfuncs,
+                    flip_threshold=None, flipped_syndromes=None, minimum_shots=None,
+                    postselect_calibration=True,
+                    odr_expected_observable=1,
+                    zne_func=znemod.perform_linear_zne,
+                    confidence=None,
+                    register_name="meas",
+                    return_samples=False, return_postselected_samples=False,
+                    verbose=False):
+    # Same as odrzne_gaugetwirling for the executor batches of z2hm_tdepsb_gaugetwirling_submit.py, with item results of shape
+    # (nnoise_factors, ntimes) as returned by ExecDB.load_final_samples_from_local_or_ibmq (None for failed jobs). All the
+    # randomizations of an item (Pauli and gauge twirling) are merged before the recovery. Returns the same observables as
+    # odrzne_gaugetwirling, [ZNE, ODR+Post, Post, Post cal, Raw], ZNE with shape (ntimes, nobservables) and the rest with shape
+    # (nnoise_factors, ntimes, nobservables). The samples dicts workflows apply the observables as Pauli objects (label position q
+    # acting on qubit n-1-q) and the executor ones as written (label position q on qubit q), so the observables are reversed here
+    # to measure the same operators. With postselect_calibration=False, the calibration observables that set the ODR rates (Post cal)
+    # are measured without gauge recovery, as with postselect_odr=False in diag_obs_postselection_and_odr
+    if return_postselected_samples:
+        raise NotImplementedError("odrzne_executor does not build postselected samples dicts")
+    try:
+        noise_factors = job_data["noise_factors"]
+    except KeyError:
+        try:
+            noise_factors = job_data["noise_rates"]
+        except KeyError:
+            raise WorkflowError("job_data must contain the 'noise_factors' or 'noise_rates' key")
+    noise_factors = np.array(noise_factors)
+    if not isinstance(observables_genfuncs, (tuple, list)):
+        observables_genfuncs = [observables_genfuncs]
+    if not isinstance(job_results, np.ndarray) or not isinstance(cal_results, np.ndarray):
+        raise TypeError("job_results and cal_results must be object arrays of executor item results")
+    if job_results.shape != cal_results.shape:
+        raise ValueError("job_results and cal_results must have the same shape")
+    if job_results.ndim != 2 or len(noise_factors) != job_results.shape[0]:
+        raise ValueError("job_results and cal_results must have shape (nnoise_factors, ntimes)")
+    # The noise factors are the same for all the times, or with shape (nnoise_factors, ntimes) the noise factors of every circuit
+    if noise_factors.ndim == 2 and noise_factors.shape[1] != job_results.shape[1]:
+        raise ValueError("Noise factors with shape (nnoise_factors, ntimes) must have a column per time of job_results")
+    available_results = [result for result in job_results.flat if result is not None]
+    if not available_results:
+        raise WorkflowError("There are no results for any job")
+    nqubits = available_results[0][register_name].shape[-1]
+    postselection_operators, diagonal_observables_ops, non_diagonal_observables_ops, basis = ps.initialize_postselection(nqubits, postselection_genfunc, observables_genfuncs)
+    if non_diagonal_observables_ops:
+        raise ValueError("The provided observables are not diagonal in the Z basis")
+    diagonal_observables_ops = [measure.invert_pauli_order(observable) for observable in diagonal_observables_ops]
+    nobservables = len(diagonal_observables_ops)
+
+    def measure_without_recovery(results):
+        # Observables (and their confidence intervals) without gauge recovery, NaN for missing results
+        observables = np.full((*results.shape, nobservables), np.nan)
+        observables_confidence = np.full((*results.shape, nobservables, 2), np.nan)
+        for index, result in np.ndenumerate(results):
+            if result is None:
+                continue
+            if confidence is None:
+                observables[index] = measure.measure_observables_executor(result, diagonal_observables_ops, basis, register_name=register_name)
+            else:
+                observables[index], observables_confidence[index] = measure.measure_observables_executor(result, diagonal_observables_ops, basis, confidence=confidence, register_name=register_name)
+        return observables, observables_confidence
+
+    if verbose: print("\rMeasuring raw observables...".ljust(100), end="")
+    raw_observables, raw_observables_confidence = measure_without_recovery(job_results)
+
+    if verbose: print("\rRecovering the gauge sector and measuring observables...".ljust(100), end="")
+    recovery_kwargs = {"basis": basis, "flip_threshold": flip_threshold, "flipped_syndromes": flipped_syndromes,
+                       "minimum_shots": minimum_shots, "register_name": register_name, "confidence": confidence}
+    postselected = ps.many_gauge_recovery_and_measure_executor(job_results, postselection_operators, diagonal_observables_ops, **recovery_kwargs)
+    if confidence is not None:
+        postselected_observables, postselected_observables_confidence = postselected
+    else:
+        postselected_observables = postselected
+    if postselect_calibration:
+        postselected_cal = ps.many_gauge_recovery_and_measure_executor(cal_results, postselection_operators, diagonal_observables_ops, **recovery_kwargs)
+        if confidence is not None:
+            cal_observables, cal_observables_confidence = postselected_cal
+        else:
+            cal_observables = postselected_cal
+    else:
+        if verbose: print("\rMeasuring calibration observables without recovery...".ljust(100), end="")
+        cal_observables, cal_observables_confidence = measure_without_recovery(cal_results)
+
+    # ODR and ZNE as in odrzne
+    p_arr = odr.compute_depolarizing_probability(cal_observables, odr_expected_observable, 0, nqubits)
+    if confidence is not None:
+        clean_observables, clean_observables_confidence = odr.renormalize_observable(postselected_observables, p_arr, 0, nqubits, expected_observable_arr=odr_expected_observable, observable_confidence=postselected_observables_confidence)
+    else:
+        clean_observables = odr.renormalize_observable(postselected_observables, p_arr, 0, nqubits, expected_observable_arr=odr_expected_observable)
+
+    if verbose: print("\rPerforming ZNE extrapolation...".ljust(100), end="")
+    zne_observables = np.full((job_results.shape[1], nobservables), np.nan)
+    zne_observables_confidence = np.full((job_results.shape[1], nobservables, 2), np.nan)
+    for ti in range(job_results.shape[1]):
+        time_noise_factors = noise_factors[:, ti] if noise_factors.ndim == 2 else noise_factors
+        for oind in range(nobservables):
+            zne_results = zne_func(time_noise_factors, clean_observables[:, ti, oind])
+            zne_observables[ti, oind] = zne_results.intercept
+            zne_observables_confidence[ti, oind, 0] = zne_results.intercept - zne_results.std_err
+            zne_observables_confidence[ti, oind, 1] = zne_results.intercept + zne_results.std_err
+
+    if verbose: print(f"\rCurated {len(available_results)} executor results".ljust(100))
+    to_return = [[zne_observables, clean_observables, postselected_observables, cal_observables, raw_observables]]
+    if confidence is not None:
+        to_return.append([zne_observables_confidence, clean_observables_confidence, postselected_observables_confidence, cal_observables_confidence, raw_observables_confidence])
+    if return_samples:
+        to_return.append([job_results, cal_results])
     return to_return if len(to_return) > 1 else to_return[0]
 
 def peazne_learnerpost(executor_jobs, job_data, observables_genfuncs, service,
@@ -645,6 +817,81 @@ def peazne(executor_results, job_data, observables_genfuncs, service,
         to_return.append(job_results)
     return to_return if len(to_return) > 1 else to_return[0]
 
+def odr_postselection_executor(job_executor_result, cal_executor_results, job_data, service, postselection_genfunc, observables_genfuncs, confidence=None,
+                               flip_threshold=None, flipped_syndromes=None, minimum_shots=None,
+                               postselect_odr=True, odr_expected_observable=1,
+                               non_markovian_postselection_strategy="edge",
+                               register_name="meas",
+                               return_samples=False,
+                               verbose=False):
+    if confidence is not None:
+        raise NotImplementedError("Confidence intervals are not yet implemented for odr_postselection_executor")
+
+    if not isinstance(observables_genfuncs, (tuple, list)):
+        observables_genfuncs = [observables_genfuncs]
+
+    job_results = np.array([job.result()[0] for job in job_executor_result], dtype=object).flatten()
+    cal_job_results = np.array([job.result()[0] for job in cal_executor_results], dtype=object).flatten()
+
+    nqubits = list(job_results[0].values())[0].shape[-1]
+    postselection_operators, diagonal_observables_ops, non_diagonal_observables_ops, basis = ps.initialize_postselection(nqubits, postselection_genfunc, observables_genfuncs)
+    if non_diagonal_observables_ops:
+        raise ValueError("The provided observables are not diagonal in the Z basis")
+
+    backend = service.backend(job_data["backend"])
+
+    if job_data["non_markovian_post"]:
+        job_circuits = [executorutils.load_circuit_from_job(job) for job in job_executor_result]
+        cal_circuits = [executorutils.load_circuit_from_job(job) for job in cal_executor_results]
+        job_non_markovian_postselectors = [PostSelector.from_circuit(circuit, backend.coupling_map) for circuit in job_circuits]
+        cal_non_markovian_postselectors = [PostSelector.from_circuit(circuit, backend.coupling_map) for circuit in cal_circuits]
+    else:
+        job_non_markovian_postselectors = [None]*len(job_results)
+        cal_non_markovian_postselectors = [None]*len(cal_job_results)
+
+    if verbose: print("\rMeasuring job observables with postselection...".ljust(100), end="")
+    raw_observables = []
+    for i, result in enumerate(job_results):
+        this_obs = ps.gauge_recovery_and_measure_executor(result, postselection_operators, diagonal_observables_ops, 
+                                                          non_markovian_postselector=job_non_markovian_postselectors[i],
+                                                          non_markovian_postselection_strategy=non_markovian_postselection_strategy,
+                                                          flip_threshold=flip_threshold, flipped_syndromes=flipped_syndromes, minimum_shots=minimum_shots,
+                                                          register_name=register_name)
+        raw_observables.append(this_obs)
+
+    if verbose: print("\rMeasuring calibration observables...".ljust(100), end="")
+    if postselect_odr:
+        cal_observables = []
+        for i in range(len(cal_circuits)):
+            this_obs = ps.gauge_recovery_and_measure_executor(result, postselection_operators, diagonal_observables_ops, 
+                                                              non_markovian_postselector=cal_non_markovian_postselectors[i],
+                                                              non_markovian_postselection_strategy=non_markovian_postselection_strategy,
+                                                              flip_threshold=flip_threshold, flipped_syndromes=flipped_syndromes, minimum_shots=minimum_shots,
+                                                              register_name=register_name)
+            cal_observables.append(this_obs)
+        cal_observables = np.array(cal_observables)
+    else:
+        cal_observables = measure.many_measure_observables_executor(cal_job_results, diagonal_observables_ops)
+
+    clean_observables = np.zeros_like(postselected_observables)
+    for i in range(len(postselected_observables)):
+        odr_rate = odr.compute_depolarizing_probability(cal_observables[i], odr_expected_observable, 0, nqubits)
+        clean_observables[i] = odr.renormalize_observable(
+            postselected_observables[i], odr_rate, 0, nqubits,
+            observable_range=None, expected_observable_arr=odr_expected_observable
+        )
+
+    circuits_shape = job_data["job_circuits_shape"]
+    postselected_observables = postselected_observables.reshape((*circuits_shape, len(observables_genfuncs)))
+    cal_observables = cal_observables.reshape((*circuits_shape, len(observables_genfuncs)))
+    clean_observables = clean_observables.reshape((*circuits_shape, len(observables_genfuncs)))
+
+    if verbose: print(f"\rLoaded {len(job_results) + len(cal_job_results)} jobs".ljust(100))
+    to_return = [[clean_observables, postselected_observables, cal_observables]]
+    if return_samples:
+        to_return.append([job_results, cal_job_results])
+    return to_return if len(to_return) > 1 else to_return[0]
+
 def sum_observables_terms(observables_expectation, observables_coupling, observables_confidence=None):
     observables_coupling = miscutils.to_padded_array(observables_coupling, fill_value=np.nan, dtype=float)
     if observables_expectation.shape[::2] != observables_coupling.shape:
@@ -654,7 +901,7 @@ def sum_observables_terms(observables_expectation, observables_coupling, observa
     summed_observables = np.nansum(summed_observables, axis=0)
     if observables_confidence is not None:
         left_err = observables_expectation - observables_confidence[:, :, :, 0]
-        right_err = observables_expectation + observables_confidence[:, :, :, 1]
+        right_err = observables_confidence[:, :, :, 1] - observables_expectation
         left_err_times_coupling = np.abs(left_err * observables_coupling[:, None, :])**2
         right_err_times_coupling = np.abs(right_err * observables_coupling[:, None, :])**2
         summed_left_err = np.nansum(left_err_times_coupling, axis=2)
@@ -834,7 +1081,10 @@ def load_from_db_and_curate(job_db, batch_args, ibmq_service, curate_func, *,
         if verbose: print(f"Loaded curated data.")
 
     if return_data:
-        return curated_data, job_data
+        try:
+            return curated_data, job_data
+        except UnboundLocalError:
+            return curated_data, None # To do: Save Job data in curated data
     else:
         return curated_data
 

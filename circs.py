@@ -233,10 +233,10 @@ def transpile_circuits_with_consistent_layout(logical_circuits, backend, target=
     if layout is None:
         transpiled_circuits = pm.run(logical_circuits[:2])
         if transpiled_circuits[1].layout is not None:
-            first_layout = transpiled_circuits[1].layout.final_index_layout()
+            last_layout = transpiled_circuits[1].layout.final_index_layout()
         else:
-            first_layout = None
-        pm = generate_preset_pass_manager(optimization_level=optimization_level, backend=backend, target=target, initial_layout=first_layout)
+            last_layout = None
+        pm = generate_preset_pass_manager(optimization_level=optimization_level, backend=backend, target=target, initial_layout=last_layout)
         transpiled_circuits += pm.run(logical_circuits[2:])
     else:
         transpiled_circuits = pm.run(logical_circuits)
@@ -253,6 +253,7 @@ def transpile_circuit_to_many_layouts(logical_circuit, backend, initial_layouts,
     return transpiled_circuits
 
 def box_circuits(circ_arr, **box_kwargs):
+    circ_arr = numpy_array_of_circuits(circ_arr)
     bpm = generate_boxing_pass_manager(**box_kwargs)
     ogshape = circ_arr.shape
     circ_arr = circ_arr.flatten().tolist()
@@ -273,7 +274,8 @@ def get_unique_boxes(circ_arr, undress_boxes=True, normalize_annotations=None):
         unique_instructions.append(find_unique_box_instructions(circ, undress_boxes=undress_boxes, normalize_annotations=normalize_annotations))
     return unique_instructions
 
-def samplomatic_build(circuits):
+def samplomatic_build(circuits, squeeze=True):
+    # With squeeze=False, templates and samplexes are object arrays with the shape of circuits, without dropping length-1 axes
     if isinstance(circuits, QuantumCircuit):
         circuits = [circuits]
     circuits = numpy_array_of_circuits(circuits)
@@ -284,8 +286,12 @@ def samplomatic_build(circuits):
         this_template, this_samples = samplomatic.build(circ)
         templates.append(this_template)
         samplexes.append(this_samples)
-    templates = numpy_array_of_circuits(templates).reshape(ogshape).squeeze().tolist()
-    samplexes = np.array(samplexes, dtype=object).reshape(ogshape).squeeze().tolist()
+    templates = numpy_array_of_circuits(templates).reshape(ogshape)
+    samplexes_arr = np.empty(len(samplexes), dtype=object)
+    samplexes_arr[:] = samplexes
+    samplexes = samplexes_arr.reshape(ogshape)
+    if squeeze:
+        return templates.squeeze().tolist(), samplexes.squeeze().tolist()
     return templates, samplexes
 
 def translate_to_backend_gateset(backend, circuits, optimization_level=3):

@@ -3,14 +3,25 @@ import multiprocessing as mp
 import numpy as np
 
 def combine_samples_dicts(samples_dicts):
-    final_samples_dict = samples_dicts[0].copy()
-    for samples_dict in samples_dicts[1::]:
-        for state in samples_dict.keys():
-            if final_samples_dict.get(state, None) is not None:
-                final_samples_dict[state] += samples_dict[state]
-            else:
-                final_samples_dict[state] = samples_dict[state]
-    return final_samples_dict
+    # Combines the samples dicts along the last axis, e.g. (..., nrandomizations) -> (...)
+    # A one-dimensional list or array of samples dicts returns a single samples dict
+    samples_dicts = np.array(samples_dicts, dtype=object)
+    if samples_dicts.ndim == 1:
+        final_samples_dict = samples_dicts[0].copy()
+        for samples_dict in samples_dicts[1::]:
+            for state in samples_dict.keys():
+                if final_samples_dict.get(state, None) is not None:
+                    final_samples_dict[state] += samples_dict[state]
+                else:
+                    final_samples_dict[state] = samples_dict[state]
+        return final_samples_dict
+    final_samples_shape = samples_dicts.shape[:-1]
+    samples_to_combine = samples_dicts.reshape(-1, samples_dicts.shape[-1])
+    with mp.Pool(mp.cpu_count()) as pool:
+        combined_samples_dicts = pool.map(combine_samples_dicts, [samples_to_combine[i, :] for i in range(samples_to_combine.shape[0])])
+    final_samples_dicts = np.empty(len(combined_samples_dicts), dtype=object)
+    final_samples_dicts[:] = combined_samples_dicts
+    return final_samples_dicts.reshape(final_samples_shape)
 
 def hextobinsamples(sd, nqubits):
     return {f"{int(k, 16):0{nqubits}b}": v for k, v in sd.items()}

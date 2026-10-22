@@ -99,7 +99,7 @@ def plot_many_lines(x, ys, x_label="", x_ticks=None, y_label="", y_ticks=None, l
     plt.show()
     plt.rcdefaults()
 
-def matrix(matrix_to_plot, cmap="inferno", cbar_range=None, clabel=r"$\left|\left\langle u(t_a) \right| \left. u(t_b) \right\rangle\right|^2$", filepath=""):
+def matrix(matrix_to_plot, cmap="inferno", xlabel="Row", ylabel="Column", xticks=None, yticks=None, cbar_range=None, clabel=r"$\left|\left\langle u(t_a) \right| \left. u(t_b) \right\rangle\right|^2$", filepath=""):
     plt.rc("text", usetex=True)
     plt.rc("font", family="serif", size=18, weight="bold")
     xs = np.arange(matrix_to_plot.shape[1])
@@ -109,8 +109,10 @@ def matrix(matrix_to_plot, cmap="inferno", cbar_range=None, clabel=r"$\left|\lef
         vmin, vmax = None, None
     else:
         vmin, vmax = cbar_range
-    plt.xlabel(r"$\mathrm{Columns}$")
-    plt.ylabel(r"$\mathrm{Rows}$")
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.xticks(xticks)
+    plt.yticks(yticks)
     plt.pcolormesh(X, Y, matrix_to_plot, cmap=cmap, vmin=vmin, vmax=vmax)
     plt.gca().invert_yaxis()
     plt.colorbar(label=clabel)
