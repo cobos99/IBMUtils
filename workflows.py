@@ -589,7 +589,7 @@ def odrzne_gaugetwirling(job_samples, cal_samples, job_data, postselection_genfu
 
 def odrzne_executor(job_results, cal_results, job_data, postselection_genfunc, observables_genfuncs,
                     flip_threshold=None, flipped_syndromes=None, minimum_shots=None,
-                    postselect_calibration=True,
+                    postselect_calibration=True, postselect_jobs=True,
                     odr_expected_observable=1,
                     zne_func=znemod.perform_linear_zne,
                     confidence=None,
@@ -603,7 +603,8 @@ def odrzne_executor(job_results, cal_results, job_data, postselection_genfunc, o
     # (nnoise_factors, ntimes, nobservables). The samples dicts workflows apply the observables as Pauli objects (label position q
     # acting on qubit n-1-q) and the executor ones as written (label position q on qubit q), so the observables are reversed here
     # to measure the same operators. With postselect_calibration=False, the calibration observables that set the ODR rates (Post cal)
-    # are measured without gauge recovery, as with postselect_odr=False in diag_obs_postselection_and_odr
+    # are measured without gauge recovery, as with postselect_odr=False in diag_obs_postselection_and_odr. With postselect_jobs=False,
+    # the simulation observables (Post) are measured without gauge recovery, so they equal Raw and ODR and ZNE are applied to them
     if return_postselected_samples:
         raise NotImplementedError("odrzne_executor does not build postselected samples dicts")
     try:
@@ -651,14 +652,17 @@ def odrzne_executor(job_results, cal_results, job_data, postselection_genfunc, o
     if verbose: print("\rMeasuring raw observables...".ljust(100), end="")
     raw_observables, raw_observables_confidence = measure_without_recovery(job_results)
 
-    if verbose: print("\rRecovering the gauge sector and measuring observables...".ljust(100), end="")
     recovery_kwargs = {"basis": basis, "flip_threshold": flip_threshold, "flipped_syndromes": flipped_syndromes,
                        "minimum_shots": minimum_shots, "register_name": register_name, "confidence": confidence}
-    postselected = ps.many_gauge_recovery_and_measure_executor(job_results, postselection_operators, diagonal_observables_ops, **recovery_kwargs)
-    if confidence is not None:
-        postselected_observables, postselected_observables_confidence = postselected
+    if postselect_jobs:
+        if verbose: print("\rRecovering the gauge sector and measuring observables...".ljust(100), end="")
+        postselected = ps.many_gauge_recovery_and_measure_executor(job_results, postselection_operators, diagonal_observables_ops, **recovery_kwargs)
+        if confidence is not None:
+            postselected_observables, postselected_observables_confidence = postselected
+        else:
+            postselected_observables = postselected
     else:
-        postselected_observables = postselected
+        postselected_observables, postselected_observables_confidence = raw_observables.copy(), raw_observables_confidence.copy()
     if postselect_calibration:
         postselected_cal = ps.many_gauge_recovery_and_measure_executor(cal_results, postselection_operators, diagonal_observables_ops, **recovery_kwargs)
         if confidence is not None:

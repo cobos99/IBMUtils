@@ -1,8 +1,10 @@
 from qiskit_ibm_runtime.exceptions import RuntimeJobFailureError, RuntimeInvalidStateError
 from qiskit_ibm_runtime.results import QuantumProgramResult
 from qiskit_ibm_runtime import RuntimeDecoder, RuntimeEncoder
+from qiskit.primitives import PrimitiveResult
 from utils.samples import group_multirep_samples_dicts
 import utils.execution as execution
+import dataclasses
 import numpy as np
 import warnings
 import json
@@ -260,8 +262,13 @@ def save_job_result(filepath, job):
         # Executor results are not JSON serializable, their arrays are saved in a compressed npz file next to filepath
         save_quantum_program_result(os.path.splitext(filepath)[0] + ".npz", result)
     else:
+        to_save = result
+        if dataclasses.is_dataclass(result.metadata.get("executor")):
+            # Executor Sampler results (decoded to SamplerV2 format) carry the executor metadata as a dataclass, saved as a dict
+            to_save = PrimitiveResult(list(result), metadata=result.metadata | {"executor": dataclasses.asdict(result.metadata["executor"])})
+        serialized = json.dumps(to_save, cls=RuntimeEncoder)    # before opening the file, so that a failure leaves no partial file
         with open(filepath, "w") as f:
-            json.dump(result, f, cls=RuntimeEncoder)
+            f.write(serialized)
     return result
 
 def save_quantum_program_result(filepath, result):
